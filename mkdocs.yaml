@@ -1,0 +1,67 @@
+site_name: abstractions
+site_description: Abstractions for programming in Python
+
+theme:
+  name: material
+  locale: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - toc.integrate
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.share
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: ["src"]
+          options:
+            show_signature_annotations: true
+            heading_level: 3
+            docstring_style: google
+            merge_init_into_class: true
+
+nav:
+  - Home: index.md
+
+
+repo_url: https://github.com/arjunguha/abstractions
+repo_name: arjunguha/abstractions
+edit_uri: edit/main/docs/
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/arjunguha/abstractions
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/abstractions/

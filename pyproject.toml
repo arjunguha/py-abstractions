@@ -1,0 +1,27 @@
+[project]
+name = "abstractions"
+version = "0.1.0"
+description = "Abstractions for Python programming"
+readme = "README.md"
+authors = [
+    { name = "Arjun Guha", email = "a.guha@northeastern.edu" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.9"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.6.15",
+    "mkdocstrings[python]>=0.29.1",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+]
