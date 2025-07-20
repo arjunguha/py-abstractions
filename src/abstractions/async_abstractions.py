@@ -1,5 +1,10 @@
+"""
+This module contains abstractions for async programming.
+"""
 import asyncio
 from typing import Awaitable, AsyncIterator, TypeVar
+
+# cspell:ignore sema
 
 T = TypeVar("T")
 
@@ -49,7 +54,7 @@ async def run_bounded(
     ```
 
     The code above will run 10 tasks concurrently and also stream the file
-    line-by-line.
+    line-by-line. The results will be **out of order**.
     """
 
     # A unique object that we put on a queue. When a task receives this, it
@@ -59,19 +64,27 @@ async def run_bounded(
 
     task_q = asyncio.Queue(limit)
     result_q = asyncio.Queue()
-    # Tracks how many consumers are available. When 0, all consumers are busy
-    # running tasks and producer
-    consumer_sema = asyncio.Semaphore(limit)
+    # Why do we need a semaphore, when the .put and .get methods on the queue
+    # already block? We want to not pull the next task from tasks until we have
+    # a consumer ready to run it immediately.
+    #
+    # This semaphore tracks the number of consumers waiting to get tasks from
+    # the queue. The producer acquires (decrement) the semaphore immediately
+    # before fetching a new task from the tasks generator. Each consumer
+    # releases (increments) the semaphore immediately before it waits to .get()
+    # a task from the queue. We initialize it to zero because at this point, no
+    # consumers have been created.
+    consumer_sema = asyncio.Semaphore(0)
 
     async def producer():
         # Fetch tasks and put them on the queue. Blocks when the queue hits
         # limit, which limits the rate at which we fetch tasks, and also ensures
         # that we do not fetch all tasks at once.
+        await consumer_sema.acquire()
         async for coroutine in tasks:
-            # When we enqueue a task, ensure that there is a consumer ready to
-            # take it.
-            async with consumer_sema:
-                await task_q.put(coroutine)
+            await task_q.put(coroutine)
+            await consumer_sema.acquire()  # For the next iteration
+
         # Each consumer will receive a sentinel and shut down.
         for _ in range(limit):
             await task_q.put(complete_sentinel)
@@ -80,16 +93,16 @@ async def run_bounded(
         # We create _limit_ consumers, which limits how many tasks run
         # concurrently.
         while True:
-            async with consumer_sema:
-                coroutine = await task_q.get()
-                if coroutine is complete_sentinel:
-                    break
-                fut = asyncio.Future()
-                try:
-                    fut.set_result(await coroutine)
-                except Exception as exn:
-                    fut.set_exception(exn)
-                await result_q.put(fut)
+            consumer_sema.release()
+            coroutine = await task_q.get()
+            if coroutine is complete_sentinel:
+                break
+            fut = asyncio.Future()
+            try:
+                fut.set_result(await coroutine)
+            except Exception as exn:
+                fut.set_exception(exn)
+            await result_q.put(fut)
 
     async def gen_results():
         while True:

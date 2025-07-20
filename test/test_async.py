@@ -2,6 +2,21 @@ import pytest
 import asyncio
 from abstractions.async_abstractions import run_bounded
 
+@pytest.mark.asyncio
+async def test_run_bounded_with_no_concurrency():
+    async def task():
+        print(f"Task started")
+        await asyncio.sleep(0.1)
+        print(f"Task completed")
+
+    async def gen_tasks():
+        yield task()
+        yield task()
+        yield task()
+
+    async for r in run_bounded(gen_tasks(), 1):
+        await r
+
 
 @pytest.mark.asyncio
 async def test_run_bounded():
