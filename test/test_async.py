@@ -3,6 +3,26 @@ import asyncio
 from abstractions.async_abstractions import run_bounded
 
 @pytest.mark.asyncio
+async def test_run_bounded_last_first():
+
+    results = [ ] 
+    async def task(n):
+        if n < 999:
+            await asyncio.sleep(1)
+            results.append(f"Task {n} completed")
+        else:
+            await asyncio.sleep(0.01)
+            results.append(f"Task {n} completed")
+
+    async def gen_tasks():
+        for i in range(1000):
+            yield task(i)
+
+    async for r in run_bounded(gen_tasks(), 1000):
+        await r
+    assert results[0] == "Task 999 completed"
+
+@pytest.mark.asyncio
 async def test_run_bounded_with_no_concurrency():
     async def task():
         print(f"Task started")
