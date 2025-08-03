@@ -4,9 +4,22 @@ This module contains abstractions for data storage.
 
 import json
 import sys
-from typing import Protocol, Iterator, AsyncIterator, Tuple, List, Awaitable, Literal
+from collections import Counter
+from typing import (
+    Protocol,
+    Iterator,
+    AsyncIterator,
+    Tuple,
+    List,
+    Awaitable,
+    Literal,
+    Callable,
+    Dict,
+)
 from pathlib import Path
 from abstractions.async_abstractions import run_bounded
+from collections import Counter
+import asyncio
 
 
 class RowGenerator(Protocol):
@@ -23,6 +36,195 @@ def _error(on_error: OnError, message: str):
         print(message, file=sys.stderr)
     elif on_error == "raise":
         raise ValueError(message)
+
+
+def _num_lines(file_name: Path) -> int:
+    if not file_name.exists():
+        return 0
+    with file_name.open("rt") as f:
+        return sum(1 for _ in f)
+
+
+async def map_by_key_jsonl_file(
+    src: Path,
+    dst: Path,
+    f: Callable[[dict], Awaitable[dict]],
+    *,
+    key: str,
+    num_concurrent: int,
+    keep_columns: List[str],
+    on_error: OnError,
+):
+    """
+    Apply an async transformation to exactly one representative row from each
+    equivalence class in *src* (rows that share `key`), writing a row for every
+    line in *src* to *dst*.
+
+    ### Parameters
+     
+     - `src, dst : Path`: source and destination JSONL files.
+     - `f : Callable[[dict], Awaitable[dict]]`: async function invoked once per distinct value of *key*.
+     - `key : str`: column whose value defines the equivalence classes.
+     - `num_concurrent : int`: maximum number of concurrent invocations of *f*.
+     - `keep_columns : List[str]`: columns to copy verbatim from *src* to each output row.
+     - `on_error : Literal["print", "raise"]`: how to handle inconsistencies while resuming.
+
+    ### Behaviour
+
+    - The first time a key is encountered, that row is passed to *f*; its result
+       is cached and duplicated for every row in the same class.
+
+    - If *dst* already exists, rows are read to determine which keys are
+      complete so the computation can resume without repeating work.
+
+    ### Example
+
+     Consider the following input file:
+
+     ```jsonl
+     { "key": 10, "other": "A", "discarded": "X" }
+     { "key": 20, "other": "B", "discarded": "Y" }
+     { "key": 10, "other": "C", "discarded": "Z" }
+     ```
+
+     Consider the following application (inside an async context):
+
+     ```python
+     async def compute(row):
+         return { "result": row["key"] + 1, "key": row["key"] }
+
+     await map_by_key_jsonl_file(
+         src,
+         dst,
+         f=compute,
+         key="key",
+         keep_columns=["other"],
+         on_error="raise",
+         num_concurrent=1,
+     )
+     ```
+
+     Because the file contains two rows whose key is 10 and one whose key is 20,
+     *f* is called twice: once with the row with *key* 10 and once with the row
+     with *key* 20.
+
+     The output file *dst* will be a permutation of:
+
+     ```jsonl
+     { "key": 10, "result": 11, "other": "A" }
+     { "key": 20, "result": 21, "other": "B" }
+     { "key": 10, "result": 11, "other": "C" }
+     ```
+
+     It omits the *discarded* column. We always emit the *key* column. We
+     emit the column *other* because it was specified in the *keep_columns*
+     argument. Finally, we include all the columns from *f*'s output.
+    """
+
+    # The assumption is that src may be enormous, and we don't want to read
+    # all of it into memory.
+    MAX_SRC_LINES_TO_HOLD_IN_MEMORY = 100
+
+    f_args_buffer = asyncio.Queue(MAX_SRC_LINES_TO_HOLD_IN_MEMORY)
+
+    # f_results[key] is a future that will hold the result of applying f to the
+    # representative row for key. We will eventually hold all results from f
+    # in memory. So, f should return a compact result.
+    f_results: Dict[str, asyncio.Future[dict]] = {}
+
+    dst_rows_buffer = asyncio.Queue()
+
+    async def read_src_proc(skip_rows: int):
+        key_counts = Counter()
+        seen_row_reps = set()
+        with src.open("rt") as f:
+            for line_num, line in enumerate(f):
+                if line_num < skip_rows:
+                    continue
+                row = json.loads(line)
+                row_key = row[key]
+
+                # If row_key not in f_results, this is the representative row.
+                # So, we add it to f_args_buffer.
+                if row_key not in f_results:
+                    f_results[row_key] = asyncio.Future()
+                    # The await below stops us from keeping too many full rows
+                    # in memory if f is slow.
+                    await f_args_buffer.put(row)
+
+                partial_dst_row = {k: row[k] for k in keep_columns}
+                partial_dst_row[key] = row_key
+                # The await below stops us from keeping too many output rows
+                # in memory if f is slow.
+                await dst_rows_buffer.put(partial_dst_row)
+            # The Nones below signal end of input to the other processes.
+            await dst_rows_buffer.put(None)
+            for _ in range(num_concurrent):
+                await f_args_buffer.put(None)
+
+    async def write_dst_proc():
+        with dst.open("at") as dst_f:
+            while True:
+                # It is partial because we don't know the result of f yet.
+                partial_dst_row = await dst_rows_buffer.get()
+                if partial_dst_row is None:
+                    break
+                try:
+                    f_result = await f_results[partial_dst_row[key]]
+                except:
+                    # If f had failed, we skip it on output. We would have either
+                    # printed a warning once, or raised an exception earlier that
+                    # would have aborted the whole task group.
+                    continue
+
+                dst_row = {**partial_dst_row, **f_result}
+                json.dump(dst_row, dst_f)
+                dst_f.write("\n")
+                dst_f.flush()
+
+    async def apply_f_proc():
+        while True:
+            row = await f_args_buffer.get()
+            if row is None:
+                break
+            row_key = row[key]
+            f_slot = f_results[row_key]
+            try:
+                result = await f(row)
+                f_slot.set_result(result)
+            except Exception as e:
+                f_slot.set_exception(e)
+                _error(on_error, f"Error applying f to {row}: {e}")
+
+    def initialize_f_results(dst_f):
+        skip_rows = 0
+        for line in dst_f:
+            skip_rows = skip_rows + 1
+            row = json.loads(line)
+            row_key = row[key]
+            if row_key not in f_results:
+                fut = asyncio.Future()
+                fut.set_result(
+                    {
+                        k: row[k]
+                        for k in row.keys()
+                        if k != key and k not in keep_columns
+                    }
+                )
+                f_results[row_key] = fut
+        return skip_rows
+
+    async with asyncio.TaskGroup() as tg:
+        if dst.exists():
+            with dst.open("rt") as dst_f:
+                skip_rows = initialize_f_results(dst_f)
+        else:
+            skip_rows = 0
+
+        tg.create_task(read_src_proc(skip_rows))
+        tg.create_task(write_dst_proc())
+        for _ in range(num_concurrent):
+            tg.create_task(apply_f_proc())
 
 
 async def create_or_resume_jsonl_file(
