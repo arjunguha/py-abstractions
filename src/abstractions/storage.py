@@ -15,6 +15,7 @@ from typing import (
     Literal,
     Callable,
     Dict,
+    Optional,
 )
 from pathlib import Path
 from abstractions.async_abstractions import run_bounded
@@ -54,10 +55,11 @@ async def map_by_key_jsonl_file(
     num_concurrent: int,
     keep_columns: List[str],
     on_error: OnError,
+    progress: Optional[Callable[[],None]] = None,
 ):
     """
     Apply an async transformation to exactly one representative row from each
-    equivalence class in *src* (rows that share `key`), writing a row for every
+    equivalence class in *src* (rows that share *key*), writing a row for every
     line in *src* to *dst*.
 
     ### Parameters
@@ -68,6 +70,8 @@ async def map_by_key_jsonl_file(
      - `num_concurrent : int`: maximum number of concurrent invocations of *f*.
      - `keep_columns : List[str]`: columns to copy verbatim from *src* to each output row.
      - `on_error : Literal["print", "raise"]`: how to handle inconsistencies while resuming.
+     - `progress`: an optional function that is is called after each row is processed, even if *f* does not receive
+       the row. You can use this to display a progress bar.
 
     ### Behaviour
 
@@ -135,8 +139,6 @@ async def map_by_key_jsonl_file(
     dst_rows_buffer = asyncio.Queue()
 
     async def read_src_proc(skip_rows: int):
-        key_counts = Counter()
-        seen_row_reps = set()
         with src.open("rt") as f:
             for line_num, line in enumerate(f):
                 if line_num < skip_rows:
@@ -151,6 +153,9 @@ async def map_by_key_jsonl_file(
                     # The await below stops us from keeping too many full rows
                     # in memory if f is slow.
                     await f_args_buffer.put(row)
+
+                if progress is not None:
+                    progress()
 
                 partial_dst_row = {k: row[k] for k in keep_columns}
                 partial_dst_row[key] = row_key
@@ -212,6 +217,8 @@ async def map_by_key_jsonl_file(
                     }
                 )
                 f_results[row_key] = fut
+            if progress is not None:
+                progress()
         return skip_rows
 
     async with asyncio.TaskGroup() as tg:
