@@ -1,0 +1,1 @@
+Use `uv` to run code and tests. See `Makefile` for examples.
