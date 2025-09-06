@@ -85,12 +85,18 @@ def recv_dict_vec(out_keys: List[str], f: Callable):
 
     the_dataset = the_dataset.map(
         recv_dict_vec(["prompt", "canonical_solution"], f),
+        remove_columns=the_dataset["test"].column_names,
         batched=True,
         batch_size=10
         num_proc=2
     )
-
     ```
+
+    Note that you *must* remove the original columns if `f` filters out any 
+    items. `f` may return a column that is removed. finally, note that
+    that the `.column_names` property of a `DatasetDict` returns a dictionary
+    of column names, which is why the code above uses 
+    `the_dataset["test"].column_names`.
     """
     def wrapper(batch):
         result = { k: [] for k in out_keys }
