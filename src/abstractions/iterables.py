@@ -1,7 +1,7 @@
 """
 This module contains abstractions for iterables.
 """
-from typing import Iterable, Iterator, List, TypeVar
+from typing import Callable, Iterable, Iterator, List, TypeVar
 
 
 T = TypeVar("T")
@@ -38,3 +38,71 @@ def batches(
 
     if batch:
         yield batch
+
+
+def recv_dict_vec(out_keys: List[str], f: Callable):
+    """
+    The purpose of this abstraction is to make it easier to process batches of
+    items with the Hugging Face datasets library.
+
+    This function wraps `f` as follows. It receives a dictionary whose items are
+    lists, e.g.,:
+
+    ```python
+    { "key_1": [v_11, v_12, v_13], "key_2": [v_21, v_22, v_23], ... }
+    ```
+
+    We assume that the dictionary has at least one key.
+
+    It calls `f` on each item:
+
+    ```python
+    f({"key_1": v_11, "key_2": v_21})
+    f({"key_1": v_12, "key_2": v_22})
+    f({"key_1": v_13, "key_2": v_23})
+    ...
+    ```
+
+    `f` must optionally return a dictionary with exactly the keys in `out_keys`.
+
+    The wrapped function will accumulate all results from `f` into a dictionary
+    of lists, similar to the input.
+
+    This means that you can do this:
+
+    ```python
+    import datasets
+
+    the_dataset = datasets.load_dataset("openai/openai_humaneval")
+
+    def f(item):
+        if len(item["canonical_solution"]) > 50:
+            return None
+        return {
+         "canonical_solution": item["canonical_solution"],
+         "prompt": item["prompt"],
+        }
+
+    the_dataset = the_dataset.map(
+        recv_dict_vec(["prompt", "canonical_solution"], f),
+        batched=True,
+        batch_size=10
+        num_proc=2
+    )
+
+    ```
+    """
+    def wrapper(batch):
+        result = { k: [] for k in out_keys }
+        # Get num_items from any key in the batch (they should all have the same length)
+        batch_keys = list(batch.keys())
+        num_items = len(batch[batch_keys[0]])
+        for ix in range(num_items):
+            reconstructed_item = { k: batch[k][ix] for k in batch_keys }
+            f_result = f(reconstructed_item)
+            if f_result is None:
+                continue
+            for k in out_keys:
+                result[k].append(f_result[k])
+        return result
+    return wrapper

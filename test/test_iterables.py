@@ -1,4 +1,4 @@
-from abstractions.iterables import batches
+from abstractions.iterables import batches, recv_dict_vec
 import pytest
 
 
@@ -62,3 +62,82 @@ def test_batches_dataset_length_mismatch_raises():
 
     with pytest.raises(ValueError):
         list(batches(var_iterable, batch_size=2, epochs=2))
+
+
+def test_recv_dict_vec_basic_functionality():
+    """Test basic functionality of recv_dict_vec with a simple transformation."""
+    batch = {
+        "name": ["Alice", "Bob", "Charlie"],
+        "age": [25, 30, 35]
+    }
+
+    def process_item(item):
+        return {
+            "name": item["name"].upper(),
+            "age": item["age"] + 1
+        }
+
+    result = recv_dict_vec(["name", "age"], process_item)(batch)
+
+    expected = {
+        "name": ["ALICE", "BOB", "CHARLIE"],
+        "age": [26, 31, 36]
+    }
+
+    assert result == expected
+
+
+def test_recv_dict_vec_with_none_returns():
+    """Test that items returning None are skipped in the output."""
+    batch = {
+        "value": [1, 2, 3, 4, 5]
+    }
+
+    def filter_even(item):
+        if item["value"] % 2 == 0:
+            return None
+        return {"value": item["value"] * 10}
+
+    result = recv_dict_vec(["value"], filter_even)(batch)
+
+    expected = {
+        "value": [10, 30, 50]  # 2 and 4 were filtered out
+    }
+
+    assert result == expected
+
+
+def test_recv_dict_vec_single_item():
+    """Test with a batch containing a single item."""
+    batch = {
+        "text": ["hello"]
+    }
+
+    def add_exclamation(item):
+        return {"text": item["text"] + "!"}
+
+    result = recv_dict_vec(["text"], add_exclamation)(batch)
+
+    expected = {
+        "text": ["hello!"]
+    }
+
+    assert result == expected
+
+
+def test_recv_dict_vec_empty_lists():
+    """Test with a batch containing empty lists."""
+    batch = {
+        "data": []
+    }
+
+    def process_item(item):
+        return {"data": item["data"]}
+
+    result = recv_dict_vec(["data"], process_item)(batch)
+
+    expected = {
+        "data": []
+    }
+
+    assert result == expected
