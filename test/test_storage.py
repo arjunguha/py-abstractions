@@ -5,7 +5,11 @@ from typing import List, Tuple, AsyncIterator, Awaitable, Callable
 import asyncio
 import pytest
 
-from abstractions.storage import create_or_resume_jsonl_file, map_by_key_jsonl_file
+from abstractions.storage import (
+    create_or_resume_jsonl_file,
+    disk_cache,
+    map_by_key_jsonl_file,
+)
 import tempfile
 
 DATA_DIR = Path(__file__).parent / "test_data"
@@ -154,6 +158,38 @@ async def test_map_jsonl_trivial(tmp_path):
         on_error="raise",
     )
     assert_permutation(tmp_path / "out.jsonl", DATA_DIR / "out_trivial.jsonl")
+
+
+def test_disk_cache_roundtrip(tmp_path):
+    cache_file = tmp_path / "cache.pkl"
+    calls: list[str] = []
+
+    def expensive(value):
+        calls.append(f"expensive:{value}")
+        return value * 2
+
+    def expensive2(value):
+        calls.append(f"expensive2:{value}")
+        return value + 5
+
+    with disk_cache(cache_file):
+        a = expensive(3)
+        b = expensive2(7)
+
+    assert cache_file.exists()
+    assert calls == ["expensive:3", "expensive2:7"]
+    assert a == 6
+    assert b == 12
+
+    calls.clear()
+
+    with disk_cache(cache_file):
+        a = expensive(3)
+        b = expensive2(7)
+
+    assert calls == []
+    assert a == 6
+    assert b == 12
 
 
 @pytest.mark.asyncio
