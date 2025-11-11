@@ -52,21 +52,30 @@ def _update_frame_locals(frame, values):
 
 
 class disk_cache:
-    """Cache variables assigned inside the ``with`` block to disk using pickle.
-
-    The context manager works by temporarily inspecting the caller's stack frame and
-    intercepting execution of the ``with`` block:
-
-    * On the first run, the body executes normally. Once the ``with`` block exits we
-      compare the locals before/after execution and pickle any new or modified
-      bindings. These are written to ``path``.
-    * On subsequent runs, the cached bindings are re-injected into the caller's
-      frame *before* the ``with`` body executes. A trace hook then raises a private
-      ``_CacheHit`` exception at the first line event, which cleanly skips the body.
-
-    This design keeps the ``with`` syntax the user expects while ensuring expensive
-    computations do not re-run once cached.
     """
+    Cache variables assigned inside the ``with`` block to disk using pickle.
+
+    Example:
+
+    ```python
+    with disk_cache("cache.pkl"):
+        a = expensive_computation(...)
+        b = expensive_computation(...)
+    ```
+    """
+
+    # The context manager works by temporarily inspecting the caller's stack frame and
+    # intercepting execution of the ``with`` block:
+    # 
+    # * On the first run, the body executes normally. Once the ``with`` block exits we
+    #     compare the locals before/after execution and pickle any new or modified
+    #     bindings. These are written to ``path``.
+    # * On subsequent runs, the cached bindings are re-injected into the caller's
+    #     frame *before* the ``with`` body executes. A trace hook then raises a private
+    #     ``_CacheHit`` exception at the first line event, which cleanly skips the body.
+    # 
+    # This design keeps the ``with`` syntax the user expects while ensuring expensive
+    # computations do not re-run once cached.
 
     def __init__(self, path: str | Path):
         self._path = Path(path)
