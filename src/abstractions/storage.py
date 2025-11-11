@@ -4,6 +4,9 @@ This module contains abstractions for data storage.
 
 import json
 import sys
+import ctypes
+import inspect
+import pickle
 from collections import Counter
 from typing import (
     Protocol,
@@ -21,6 +24,135 @@ from pathlib import Path
 from abstractions.async_abstractions import run_bounded
 from collections import Counter
 import asyncio
+
+
+class _CacheHit(RuntimeError):
+    """Internal signal used to skip cached blocks."""
+
+
+def _sync_frame_locals(frame):
+    """Ensure updates to ``frame.f_locals`` are visible in the frame."""
+
+    # ``frame.f_locals`` returns a *snapshot* of the locals, not the actual storage.
+    # When we modify that mapping directly, CPython requires an explicit call to
+    # ``PyFrame_LocalsToFast`` so that the fast-locals array backing the frame is
+    # updated. Without this call, assignments performed through ``frame.f_locals``
+    # would be invisible to the executing code.
+    ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(frame), ctypes.c_int(1))
+
+
+def _update_frame_locals(frame, values):
+    """Inject *values* into *frame*'s locals."""
+
+    # ``frame.f_locals`` is an ordinary mapping, so we can ``update`` it with the
+    # cached variables. The subsequent ``_sync_frame_locals`` call is what makes the
+    # new bindings visible to the actual locals used by the interpreter.
+    frame.f_locals.update(values)
+    _sync_frame_locals(frame)
+
+
+class disk_cache:
+    """Cache variables assigned inside the ``with`` block to disk using pickle.
+
+    The context manager works by temporarily inspecting the caller's stack frame and
+    intercepting execution of the ``with`` block:
+
+    * On the first run, the body executes normally. Once the ``with`` block exits we
+      compare the locals before/after execution and pickle any new or modified
+      bindings. These are written to ``path``.
+    * On subsequent runs, the cached bindings are re-injected into the caller's
+      frame *before* the ``with`` body executes. A trace hook then raises a private
+      ``_CacheHit`` exception at the first line event, which cleanly skips the body.
+
+    This design keeps the ``with`` syntax the user expects while ensuring expensive
+    computations do not re-run once cached.
+    """
+
+    def __init__(self, path: str | Path):
+        self._path = Path(path)
+        self._frame = None
+        self._locals_before: Dict[str, object] | None = None
+        self._skip_block = False
+        self._previous_trace = None
+        self._previous_frame_trace = None
+
+    def __enter__(self):
+        frame = inspect.currentframe()
+        assert frame is not None
+        try:
+            self._frame = frame.f_back
+        finally:
+            del frame
+
+        if self._frame is None:
+            raise RuntimeError("disk_cache must be used inside a function scope")
+
+        self._locals_before = dict(self._frame.f_locals)
+
+        if self._path.exists():
+            with self._path.open("rb") as fp:
+                cached_values = pickle.load(fp)
+            _update_frame_locals(self._frame, cached_values)
+            self._skip_block = True
+            self._install_trace()
+        else:
+            self._skip_block = False
+
+        return self
+
+    def _install_trace(self):
+        assert self._frame is not None
+        self._previous_trace = sys.gettrace()
+        self._previous_frame_trace = self._frame.f_trace
+
+        cache_hit = _CacheHit()
+
+        def tracer(frame, event, arg):
+            # The tracer fires before each line executes. When we see the first line
+            # inside the caller's frame we raise ``_CacheHit`` to bail out of the
+            # ``with`` block. The exception is intercepted in ``__exit__``.
+            if frame is self._frame and event == "line":
+                raise cache_hit
+            if self._previous_trace is not None:
+                return self._previous_trace(frame, event, arg)
+            return tracer
+
+        sys.settrace(tracer)
+        self._frame.f_trace = tracer
+
+    def _remove_trace(self):
+        sys.settrace(self._previous_trace)
+        if self._frame is not None:
+            self._frame.f_trace = self._previous_frame_trace
+        self._previous_trace = None
+        self._previous_frame_trace = None
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._skip_block:
+                self._remove_trace()
+                # ``_CacheHit`` is an implementation detail we use to skip the body
+                # when cached values exist. Treat it as a non-error and swallow it.
+                if isinstance(exc, _CacheHit):
+                    return True
+                return False
+
+            assert self._frame is not None and self._locals_before is not None
+            after_locals = self._frame.f_locals
+            to_cache = {
+                name: after_locals[name]
+                for name in after_locals
+                if name not in self._locals_before or after_locals[name] != self._locals_before[name]
+            }
+            if to_cache:
+                with self._path.open("wb") as fp:
+                    pickle.dump(to_cache, fp)
+        finally:
+            self._frame = None
+            self._locals_before = None
+            self._skip_block = False
+
+        return False
 
 
 class RowGenerator(Protocol):
