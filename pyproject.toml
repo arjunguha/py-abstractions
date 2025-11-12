@@ -1,6 +1,6 @@
 [project]
 name = "abstractions"
-version = "0.6.0"
+version = "0.6.1"
 description = "Abstractions for Python programming"
 readme = "README.md"
 authors = [
