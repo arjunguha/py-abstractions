@@ -10,7 +10,6 @@ from abstractions.storage import (
     disk_cache,
     map_by_key_jsonl_file,
 )
-import tempfile
 
 DATA_DIR = Path(__file__).parent / "test_data"
 # ---------------------------------------------------------------------------
@@ -190,6 +189,40 @@ def test_disk_cache_roundtrip(tmp_path):
     assert calls == []
     assert a == 6
     assert b == 12
+
+
+class EqualityRaisingClass:
+    """A class that raises an exception when equality operators are called."""
+    
+    def __init__(self, value):
+        self.value = value
+    
+    def __eq__(self, other):
+        raise RuntimeError("Equality check should not be called")
+    
+    def __ne__(self, other):
+        raise RuntimeError("Inequality check should not be called")
+
+
+def test_disk_cache_equality_bug_instance_inside_block(tmp_path):
+    """Reproduces bug: instance created inside disk_cache block causes exception."""
+    cache_file = tmp_path / "cache.pkl"
+    
+    # Create variable before the block so it exists in _locals_before
+    obj = None
+    
+    # On first run, obj is reassigned inside the block, triggering comparison on exit
+    # This should fail because disk_cache uses != which calls __ne__/__eq__
+    with disk_cache(cache_file):
+        obj = EqualityRaisingClass(42)
+
+
+def test_disk_cache_equality_bug_instance_outside_block(tmp_path):
+    """Reproduces bug: instance created outside disk_cache block causes exception."""
+    cache_file = tmp_path / "cache.pkl"
+    obj = EqualityRaisingClass(42)
+    with disk_cache(cache_file):
+        pass
 
 
 @pytest.mark.asyncio

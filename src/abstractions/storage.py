@@ -151,7 +151,7 @@ class disk_cache:
             to_cache = {
                 name: after_locals[name]
                 for name in after_locals
-                if name not in self._locals_before or after_locals[name] != self._locals_before[name]
+                if name not in self._locals_before or after_locals[name] is not self._locals_before[name]
             }
             if to_cache:
                 with self._path.open("wb") as fp:
