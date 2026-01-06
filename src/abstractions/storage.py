@@ -196,7 +196,7 @@ async def map_by_key_jsonl_file(
     num_concurrent: int,
     keep_columns: List[str],
     on_error: OnError,
-    progress: Optional[Callable[[],None]] = None,
+    progress: Optional[Callable[[bool],None]] = None,
 ):
     """
     Apply an async transformation to exactly one representative row from each
@@ -211,8 +211,9 @@ async def map_by_key_jsonl_file(
      - `num_concurrent : int`: maximum number of concurrent invocations of *f*.
      - `keep_columns : List[str]`: columns to copy verbatim from *src* to each output row.
      - `on_error : Literal["print", "raise"]`: how to handle inconsistencies while resuming.
-     - `progress`: an optional function that is is called after each row is processed, even if *f* does not receive
-       the row. You can use this to display a progress bar.
+     - `progress`: an optional function that is called after each row is written to *dst* (or skipped due to failure).
+       The function receives a boolean indicating success (True) or failure (False). You can use this to display a progress bar.
+       During initialization (when resuming), it is called with True for each existing row in *dst*.
 
     ### Behaviour
 
@@ -279,6 +280,10 @@ async def map_by_key_jsonl_file(
 
     dst_rows_buffer = asyncio.Queue()
 
+    def _progress(success: bool):
+        if progress is not None:
+            progress(success)
+
     async def read_src_proc(skip_rows: int):
         with src.open("rt") as f:
             for line_num, line in enumerate(f):
@@ -294,9 +299,6 @@ async def map_by_key_jsonl_file(
                     # The await below stops us from keeping too many full rows
                     # in memory if f is slow.
                     await f_args_buffer.put(row)
-
-                if progress is not None:
-                    progress()
 
                 partial_dst_row = {k: row[k] for k in keep_columns}
                 partial_dst_row[key] = row_key
@@ -321,12 +323,14 @@ async def map_by_key_jsonl_file(
                     # If f had failed, we skip it on output. We would have either
                     # printed a warning once, or raised an exception earlier that
                     # would have aborted the whole task group.
+                    _progress(False)
                     continue
 
                 dst_row = {**partial_dst_row, **f_result}
                 json.dump(dst_row, dst_f)
                 dst_f.write("\n")
                 dst_f.flush()
+                _progress(True)
 
     async def apply_f_proc():
         while True:
@@ -341,6 +345,9 @@ async def map_by_key_jsonl_file(
             except Exception as e:
                 f_slot.set_exception(e)
                 _error(on_error, f"Error applying f to {row}: {e}")
+                # Note: progress(False) will be called in write_dst_proc when
+                # the failed future is awaited, so we don't call it here to avoid
+                # double-counting failures.
 
     def initialize_f_results(dst_f):
         skip_rows = 0
@@ -359,7 +366,7 @@ async def map_by_key_jsonl_file(
                 )
                 f_results[row_key] = fut
             if progress is not None:
-                progress()
+                progress(True)
         return skip_rows
 
     async with asyncio.TaskGroup() as tg:
