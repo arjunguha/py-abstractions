@@ -9,6 +9,7 @@ from abstractions.storage import (
     create_or_resume_jsonl_file,
     disk_cache,
     map_by_key_jsonl_file,
+    flatmap_by_key_jsonl_file,
 )
 
 DATA_DIR = Path(__file__).parent / "test_data"
@@ -404,3 +405,173 @@ async def test_map_jsonl_error_raise_writes_prior_rows(tmp_path):
 
     assert rows, "Row for key 10 should have been written before failure"
     assert all(r["key"] == 10 for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Tests for flatmap_by_key_jsonl_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flatmap_jsonl_trivial(tmp_path):
+    """Basic test: f returns multiple items per key."""
+
+    async def task(row):
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    await flatmap_by_key_jsonl_file(
+        DATA_DIR / "in_flatmap.jsonl",
+        tmp_path / "out.jsonl",
+        task,
+        key="key",
+        keep_columns=["other"],
+        num_concurrent=1,
+        on_error="raise",
+    )
+    assert_permutation(tmp_path / "out.jsonl", DATA_DIR / "out_flatmap_trivial.jsonl")
+
+
+@pytest.mark.asyncio
+async def test_flatmap_jsonl_empty_list(tmp_path):
+    """When f returns an empty list, no output rows are produced for that key."""
+
+    async def task(row):
+        if row["key"] == 10:
+            return []
+        return [{"result": row["key"] + 1, "key": row["key"]}]
+
+    await flatmap_by_key_jsonl_file(
+        DATA_DIR / "in_flatmap.jsonl",
+        tmp_path / "out.jsonl",
+        task,
+        key="key",
+        keep_columns=["other"],
+        num_concurrent=1,
+        on_error="raise",
+    )
+
+    with (tmp_path / "out.jsonl").open() as fp:
+        rows = [json.loads(line) for line in fp]
+
+    assert len(rows) == 1
+    assert rows[0]["key"] == 20
+
+
+@pytest.mark.asyncio
+async def test_flatmap_jsonl_out_of_order_finish(tmp_path):
+    """Test that out-of-order completion works correctly with concurrency."""
+    second_row_finished = asyncio.Event()
+
+    async def task(row):
+        if row["key"] == 10:
+            await second_row_finished.wait()
+        if row["key"] == 20:
+            second_row_finished.set()
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    await flatmap_by_key_jsonl_file(
+        DATA_DIR / "in_flatmap.jsonl",
+        tmp_path / "out.jsonl",
+        task,
+        key="key",
+        keep_columns=["other"],
+        num_concurrent=2,
+        on_error="raise",
+    )
+    assert_permutation(tmp_path / "out.jsonl", DATA_DIR / "out_flatmap_trivial.jsonl")
+
+
+@pytest.mark.asyncio
+async def test_flatmap_resume_does_not_recompute(tmp_path):
+    """Resume should not re-call f for keys already in dst."""
+    src = DATA_DIR / "in_flatmap.jsonl"
+    dst = tmp_path / "out.jsonl"
+
+    # Pretend key=10 was already done with 2 results
+    precomputed = [
+        {"other": "A", "key": 10, "result": 11},
+        {"other": "A", "key": 10, "result": 12},
+    ]
+    with dst.open("w") as fp:
+        for row in precomputed:
+            json.dump(row, fp)
+            fp.write("\n")
+
+    call_counter = Counter()
+
+    async def task(row):
+        call_counter[row["key"]] += 1
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    await flatmap_by_key_jsonl_file(
+        src,
+        dst,
+        task,
+        key="key",
+        num_concurrent=1,
+        keep_columns=["other"],
+        on_error="raise",
+    )
+
+    # 10 should NOT be recomputed; 20 should be computed once.
+    assert call_counter == {20: 1}
+    assert_permutation(dst, DATA_DIR / "out_flatmap_trivial.jsonl")
+
+
+@pytest.mark.asyncio
+async def test_flatmap_f_error_print(tmp_path):
+    """If f raises and on_error='print', rows for that key are skipped."""
+    dst = tmp_path / "out.jsonl"
+
+    async def task(row):
+        if row["key"] == 10:
+            raise RuntimeError("boom")
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    await flatmap_by_key_jsonl_file(
+        DATA_DIR / "in_flatmap.jsonl",
+        dst,
+        task,
+        key="key",
+        num_concurrent=2,
+        keep_columns=["other"],
+        on_error="print",
+    )
+
+    with dst.open() as fp:
+        rows = [json.loads(line) for line in fp]
+
+    assert len(rows) == 2
+    assert all(r["key"] == 20 for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_flatmap_f_error_raise(tmp_path):
+    """If f raises and on_error='raise', the wrapper should propagate."""
+    dst = tmp_path / "out.jsonl"
+
+    async def task(row):
+        raise RuntimeError("boom")
+
+    with pytest.raises(ExceptionGroup):
+        await flatmap_by_key_jsonl_file(
+            DATA_DIR / "in_flatmap.jsonl",
+            dst,
+            task,
+            key="key",
+            num_concurrent=1,
+            keep_columns=["other"],
+            on_error="raise",
+        )
