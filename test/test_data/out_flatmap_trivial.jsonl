@@ -1,4 +1,4 @@
-{"other": "A", "key": 10, "result": 11}
-{"other": "A", "key": 10, "result": 12}
-{"other": "B", "key": 20, "result": 21}
-{"other": "B", "key": 20, "result": 22}
+{"key": 10, "other": "A", "result": 11}
+{"key": 10, "other": "A", "result": 12}
+{"key": 20, "other": "B", "result": 21}
+{"key": 20, "other": "B", "result": 22}

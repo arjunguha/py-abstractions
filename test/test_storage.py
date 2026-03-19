@@ -10,6 +10,7 @@ from abstractions.storage import (
     disk_cache,
     map_by_key_jsonl_file,
     flatmap_by_key_jsonl_file,
+    _reconcile_flatmap_dst_from_resume_log,
 )
 
 DATA_DIR = Path(__file__).parent / "test_data"
@@ -417,17 +418,18 @@ async def test_flatmap_jsonl_trivial(tmp_path):
     """Basic test: f returns multiple items per key."""
 
     async def task(row):
+        k, o = row["key"], row["other"]
         return [
-            {"result": row["key"] + 1, "key": row["key"]},
-            {"result": row["key"] + 2, "key": row["key"]},
+            {"result": k + 1, "key": k, "other": o},
+            {"result": k + 2, "key": k, "other": o},
         ]
 
     await flatmap_by_key_jsonl_file(
         DATA_DIR / "in_flatmap.jsonl",
         tmp_path / "out.jsonl",
+        tmp_path / "out.resume.jsonl",
         task,
         key="key",
-        keep_columns=["other"],
         num_concurrent=1,
         on_error="raise",
     )
@@ -441,14 +443,15 @@ async def test_flatmap_jsonl_empty_list(tmp_path):
     async def task(row):
         if row["key"] == 10:
             return []
-        return [{"result": row["key"] + 1, "key": row["key"]}]
+        k, o = row["key"], row["other"]
+        return [{"result": k + 1, "key": k, "other": o}]
 
     await flatmap_by_key_jsonl_file(
         DATA_DIR / "in_flatmap.jsonl",
         tmp_path / "out.jsonl",
+        tmp_path / "out.resume.jsonl",
         task,
         key="key",
-        keep_columns=["other"],
         num_concurrent=1,
         on_error="raise",
     )
@@ -470,17 +473,18 @@ async def test_flatmap_jsonl_out_of_order_finish(tmp_path):
             await second_row_finished.wait()
         if row["key"] == 20:
             second_row_finished.set()
+        k, o = row["key"], row["other"]
         return [
-            {"result": row["key"] + 1, "key": row["key"]},
-            {"result": row["key"] + 2, "key": row["key"]},
+            {"result": k + 1, "key": k, "other": o},
+            {"result": k + 2, "key": k, "other": o},
         ]
 
     await flatmap_by_key_jsonl_file(
         DATA_DIR / "in_flatmap.jsonl",
         tmp_path / "out.jsonl",
+        tmp_path / "out.resume.jsonl",
         task,
         key="key",
-        keep_columns=["other"],
         num_concurrent=2,
         on_error="raise",
     )
@@ -492,6 +496,7 @@ async def test_flatmap_resume_does_not_recompute(tmp_path):
     """Resume should not re-call f for keys already in dst."""
     src = DATA_DIR / "in_flatmap.jsonl"
     dst = tmp_path / "out.jsonl"
+    resume_log = tmp_path / "out.resume.jsonl"
 
     # Pretend key=10 was already done with 2 results
     precomputed = [
@@ -500,25 +505,28 @@ async def test_flatmap_resume_does_not_recompute(tmp_path):
     ]
     with dst.open("w") as fp:
         for row in precomputed:
-            json.dump(row, fp)
+            json.dump(row, fp, sort_keys=True)
             fp.write("\n")
+    with resume_log.open("w") as fp:
+        fp.write(json.dumps(10) + "\n")
 
     call_counter = Counter()
 
     async def task(row):
         call_counter[row["key"]] += 1
+        k, o = row["key"], row["other"]
         return [
-            {"result": row["key"] + 1, "key": row["key"]},
-            {"result": row["key"] + 2, "key": row["key"]},
+            {"result": k + 1, "key": k, "other": o},
+            {"result": k + 2, "key": k, "other": o},
         ]
 
     await flatmap_by_key_jsonl_file(
         src,
         dst,
+        resume_log,
         task,
         key="key",
         num_concurrent=1,
-        keep_columns=["other"],
         on_error="raise",
     )
 
@@ -535,18 +543,19 @@ async def test_flatmap_f_error_print(tmp_path):
     async def task(row):
         if row["key"] == 10:
             raise RuntimeError("boom")
+        k, o = row["key"], row["other"]
         return [
-            {"result": row["key"] + 1, "key": row["key"]},
-            {"result": row["key"] + 2, "key": row["key"]},
+            {"result": k + 1, "key": k, "other": o},
+            {"result": k + 2, "key": k, "other": o},
         ]
 
     await flatmap_by_key_jsonl_file(
         DATA_DIR / "in_flatmap.jsonl",
         dst,
+        tmp_path / "out.resume.jsonl",
         task,
         key="key",
         num_concurrent=2,
-        keep_columns=["other"],
         on_error="print",
     )
 
@@ -569,9 +578,33 @@ async def test_flatmap_f_error_raise(tmp_path):
         await flatmap_by_key_jsonl_file(
             DATA_DIR / "in_flatmap.jsonl",
             dst,
+            tmp_path / "out.resume.jsonl",
             task,
             key="key",
             num_concurrent=1,
-            keep_columns=["other"],
             on_error="raise",
         )
+
+
+def test_reconcile_flatmap_drops_unlogged_rows(tmp_path):
+    """Rows in dst without a matching resume_log entry are removed."""
+    dst = tmp_path / "out.jsonl"
+    resume_log = tmp_path / "out.resume.jsonl"
+    # Log says only key 10 is complete; dst also has a stray row for 20 (crash tail).
+    with dst.open("w") as fp:
+        json.dump({"key": 10, "other": "A", "result": 11}, fp)
+        fp.write("\n")
+        json.dump({"key": 10, "other": "A", "result": 12}, fp)
+        fp.write("\n")
+        json.dump({"key": 20, "other": "B", "result": 99}, fp)
+        fp.write("\n")
+    with resume_log.open("w") as fp:
+        fp.write(json.dumps(10) + "\n")
+
+    keys = _reconcile_flatmap_dst_from_resume_log(dst, resume_log, key="key")
+    assert keys == {10}
+
+    with dst.open() as fp:
+        rows = [json.loads(line) for line in fp]
+    assert len(rows) == 2
+    assert all(r["key"] == 10 for r in rows)
