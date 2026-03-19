@@ -19,6 +19,7 @@ from typing import (
     Callable,
     Dict,
     Optional,
+    Any,
 )
 from pathlib import Path
 from abstractions.async_abstractions import run_bounded
@@ -565,6 +566,246 @@ async def flatmap_by_key_jsonl_file(
             with dst.open("rt") as dst_f:
                 initialize_f_results(dst_f)
 
+        tg.create_task(read_src_proc())
+        tg.create_task(write_dst_proc())
+        for _ in range(num_concurrent):
+            tg.create_task(apply_f_proc())
+
+
+def _truncate_jsonl_to_line_count(path: Path, n: int) -> None:
+    """Keep the first *n* lines (raw); empty the file if *n* is 0."""
+
+    lines: List[str] = []
+    if path.exists():
+        with path.open("rt") as f:
+            for i, line in enumerate(f):
+                if i >= n:
+                    break
+                lines.append(line)
+    with path.open("wt") as f:
+        for line in lines:
+            f.write(line)
+
+
+def _write_meta_records(path: Path, records: List[dict]) -> None:
+    with path.open("wt") as mf:
+        for rec in records:
+            json.dump(rec, mf)
+            mf.write("\n")
+
+
+def _f_columns_from_flatmap_row(
+    drow: dict,
+    *,
+    keep_columns: List[str],
+    src_key: str,
+) -> dict:
+    return {
+        kk: drow[kk]
+        for kk in drow.keys()
+        if kk not in keep_columns and kk != src_key
+    }
+
+
+def _reconcile_flatmap_meta_and_dst(
+    dst: Path,
+    meta: Path,
+    *,
+    src_row_count: int,
+) -> List[dict]:
+    """
+    Load meta records (each ``{"n": int}`` = output line count for one source row
+    in order). Trim *dst* and *meta* so they stay consistent.
+    """
+
+    meta_records: List[dict] = []
+    if meta.exists():
+        with meta.open("rt") as mf:
+            for line in mf:
+                meta_records.append(json.loads(line))
+
+    if len(meta_records) > src_row_count:
+        meta_records = meta_records[:src_row_count]
+        _write_meta_records(meta, meta_records)
+
+    expected_lines = sum(rec["n"] for rec in meta_records)
+    actual_lines = _num_lines(dst)
+
+    if actual_lines > expected_lines:
+        _truncate_jsonl_to_line_count(dst, expected_lines)
+    elif actual_lines < expected_lines:
+        acc = 0
+        kept: List[dict] = []
+        for rec in meta_records:
+            n = rec["n"]
+            if acc + n > actual_lines:
+                break
+            acc += n
+            kept.append(rec)
+        meta_records = kept
+        _write_meta_records(meta, meta_records)
+        if acc < actual_lines:
+            _truncate_jsonl_to_line_count(dst, acc)
+
+    return meta_records
+
+
+def _cached_f_results_from_meta_and_dst(
+    src_rows: List[dict],
+    meta_records: List[dict],
+    dst: Path,
+    *,
+    src_key: str,
+    keep_columns: List[str],
+) -> Dict[Any, List[dict]]:
+    cached: Dict[Any, List[dict]] = {}
+    with dst.open("rt") as df:
+        for i, rec in enumerate(meta_records):
+            v = src_rows[i][src_key]
+            n = rec["n"]
+            group: List[dict] = []
+            for _ in range(n):
+                line = df.readline()
+                row = json.loads(line)
+                group.append(
+                    _f_columns_from_flatmap_row(
+                        row,
+                        keep_columns=keep_columns,
+                        src_key=src_key,
+                    )
+                )
+            cached[v] = group
+    return cached
+
+
+async def flatmap_by_key_jsonl_file_with_meta(
+    src: Path,
+    dst: Path,
+    meta: Path,
+    f: Callable[[dict], Awaitable[List[dict]]],
+    *,
+    src_key: str,
+    num_concurrent: int,
+    keep_columns: List[str],
+    on_error: OnError,
+    progress: Optional[Callable[[bool], None]] = None,
+):
+    """
+    Like ``flatmap_by_key_jsonl_file``, but writes *dst* strictly in **source row
+    order** (all outputs for row *i* before row *i+1*) and uses a sidecar *meta*
+    JSONL log for resumption.
+
+    Each line of *meta* corresponds to one fully finished source row, in order,
+    and has the shape ``{"n": <int>}`` where *n* is how many lines were appended
+    to *dst* for that row (zero is allowed). A row is only logged after all of
+    its *dst* lines have been flushed, so a crash leaves at most a partial tail
+    on *dst* with no matching meta line; on restart that tail is truncated and
+    only that source row is recomputed.
+
+    Output rows are ``{**keep_columns, **f_item}`` with *src_key* set from the
+    source row (same merge rule as ``flatmap_by_key_jsonl_file``).
+
+    **IMPORTANT**: Values of *src_key* must be unique in *src*. The source file
+    must keep the same row order between runs.
+    """
+
+    MAX_SRC_LINES_TO_HOLD_IN_MEMORY = 100
+
+    with src.open("rt") as sf:
+        src_rows = [json.loads(line) for line in sf]
+
+    meta_records = _reconcile_flatmap_meta_and_dst(
+        dst,
+        meta,
+        src_row_count=len(src_rows),
+    )
+
+    def _progress(success: bool):
+        if progress is not None:
+            progress(success)
+
+    cached: Dict[Any, List[dict]] = {}
+    if meta_records:
+        n_total = sum(rec["n"] for rec in meta_records)
+        for _ in range(n_total):
+            _progress(True)
+        if n_total > 0:
+            cached = _cached_f_results_from_meta_and_dst(
+                src_rows,
+                meta_records,
+                dst,
+                src_key=src_key,
+                keep_columns=keep_columns,
+            )
+        else:
+            for i, rec in enumerate(meta_records):
+                v = src_rows[i][src_key]
+                cached[v] = []
+
+    f_args_buffer = asyncio.Queue(MAX_SRC_LINES_TO_HOLD_IN_MEMORY)
+    f_results: Dict[Any, asyncio.Future[List[dict]]] = {}
+    dst_rows_buffer = asyncio.Queue()
+
+    for row in src_rows:
+        v = row[src_key]
+        if v in cached:
+            fut: asyncio.Future[List[dict]] = asyncio.Future()
+            fut.set_result(cached[v])
+            f_results[v] = fut
+        else:
+            f_results[v] = asyncio.Future()
+
+    async def read_src_proc():
+        for row in src_rows:
+            row_key = row[src_key]
+            if f_results[row_key].done():
+                continue
+            await f_args_buffer.put(row)
+            partial_dst_row = {k: row[k] for k in keep_columns}
+            partial_dst_row[src_key] = row_key
+            await dst_rows_buffer.put(partial_dst_row)
+        await dst_rows_buffer.put(None)
+        for _ in range(num_concurrent):
+            await f_args_buffer.put(None)
+
+    async def write_dst_proc():
+        with dst.open("at") as dst_f, meta.open("at") as meta_f:
+            while True:
+                partial_dst_row = await dst_rows_buffer.get()
+                if partial_dst_row is None:
+                    break
+                v = partial_dst_row[src_key]
+                try:
+                    f_result_list = await f_results[v]
+                except Exception:
+                    _progress(False)
+                    continue
+                for f_result in f_result_list:
+                    dst_row = {**partial_dst_row, **f_result}
+                    dst_row[src_key] = v
+                    json.dump(dst_row, dst_f)
+                    dst_f.write("\n")
+                    dst_f.flush()
+                    _progress(True)
+                json.dump({"n": len(f_result_list)}, meta_f)
+                meta_f.write("\n")
+                meta_f.flush()
+
+    async def apply_f_proc():
+        while True:
+            row = await f_args_buffer.get()
+            if row is None:
+                break
+            row_key = row[src_key]
+            f_slot = f_results[row_key]
+            try:
+                result = await f(row)
+                f_slot.set_result(result)
+            except Exception as e:
+                f_slot.set_exception(e)
+                _error(on_error, f"Error applying f to {row}: {e}")
+
+    async with asyncio.TaskGroup() as tg:
         tg.create_task(read_src_proc())
         tg.create_task(write_dst_proc())
         for _ in range(num_concurrent):

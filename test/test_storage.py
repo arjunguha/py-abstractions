@@ -10,6 +10,7 @@ from abstractions.storage import (
     disk_cache,
     map_by_key_jsonl_file,
     flatmap_by_key_jsonl_file,
+    flatmap_by_key_jsonl_file_with_meta,
 )
 
 DATA_DIR = Path(__file__).parent / "test_data"
@@ -141,6 +142,12 @@ def assert_permutation(path1: Path, path2: Path):
         for line in lines2:
             print(f"  {line}")
         assert False
+
+
+def assert_jsonl_same_order(path1: Path, path2: Path):
+    lines1 = path1.read_text().splitlines()
+    lines2 = path2.read_text().splitlines()
+    assert lines1 == lines2
 
 
 @pytest.mark.asyncio
@@ -575,3 +582,116 @@ async def test_flatmap_f_error_raise(tmp_path):
             keep_columns=["other"],
             on_error="raise",
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for flatmap_by_key_jsonl_file_with_meta
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flatmap_meta_trivial_order(tmp_path):
+    """Output matches flatmap reference and stays in source row order."""
+
+    async def task(row):
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    dst = tmp_path / "out.jsonl"
+    meta = tmp_path / "out.meta.jsonl"
+    await flatmap_by_key_jsonl_file_with_meta(
+        DATA_DIR / "in_flatmap.jsonl",
+        dst,
+        meta,
+        task,
+        src_key="key",
+        keep_columns=["other"],
+        num_concurrent=1,
+        on_error="raise",
+    )
+    assert_jsonl_same_order(dst, DATA_DIR / "out_flatmap_trivial.jsonl")
+    meta_lines = meta.read_text().splitlines()
+    assert [json.loads(l) for l in meta_lines] == [{"n": 2}, {"n": 2}]
+
+
+@pytest.mark.asyncio
+async def test_flatmap_meta_resume_skips_done(tmp_path):
+    """Meta + dst prefix: only missing source rows invoke f."""
+
+    src = DATA_DIR / "in_flatmap.jsonl"
+    dst = tmp_path / "out.jsonl"
+    meta = tmp_path / "out.meta.jsonl"
+
+    pre_dst = [
+        {"other": "A", "key": 10, "result": 11},
+        {"other": "A", "key": 10, "result": 12},
+    ]
+    with dst.open("w") as fp:
+        for row in pre_dst:
+            json.dump(row, fp)
+            fp.write("\n")
+    with meta.open("w") as fp:
+        json.dump({"n": 2}, fp)
+        fp.write("\n")
+
+    call_counter = Counter()
+
+    async def task(row):
+        call_counter[row["key"]] += 1
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    await flatmap_by_key_jsonl_file_with_meta(
+        src,
+        dst,
+        meta,
+        task,
+        src_key="key",
+        num_concurrent=1,
+        keep_columns=["other"],
+        on_error="raise",
+    )
+    assert call_counter == {20: 1}
+    assert_jsonl_same_order(dst, DATA_DIR / "out_flatmap_trivial.jsonl")
+
+
+@pytest.mark.asyncio
+async def test_flatmap_meta_truncates_orphan_dst_lines(tmp_path):
+    """Partial dst tail without a meta line is dropped and the row is redone."""
+
+    src = DATA_DIR / "in_flatmap.jsonl"
+    dst = tmp_path / "out.jsonl"
+    meta = tmp_path / "out.meta.jsonl"
+
+    with dst.open("w") as fp:
+        json.dump({"other": "A", "key": 10, "result": 11}, fp)
+        fp.write("\n")
+        json.dump({"other": "A", "key": 10, "result": 12}, fp)
+        fp.write("\n")
+        json.dump({"other": "A", "key": 10, "result": 99}, fp)
+        fp.write("\n")
+    with meta.open("w") as fp:
+        json.dump({"n": 2}, fp)
+        fp.write("\n")
+
+    async def task(row):
+        return [
+            {"result": row["key"] + 1, "key": row["key"]},
+            {"result": row["key"] + 2, "key": row["key"]},
+        ]
+
+    await flatmap_by_key_jsonl_file_with_meta(
+        src,
+        dst,
+        meta,
+        task,
+        src_key="key",
+        num_concurrent=1,
+        keep_columns=["other"],
+        on_error="raise",
+    )
+    assert_jsonl_same_order(dst, DATA_DIR / "out_flatmap_trivial.jsonl")
