@@ -181,13 +181,6 @@ def _error(on_error: OnError, message: str):
         raise ValueError(message)
 
 
-def _num_lines(file_name: Path) -> int:
-    if not file_name.exists():
-        return 0
-    with file_name.open("rt") as f:
-        return sum(1 for _ in f)
-
-
 async def map_by_key_jsonl_file(
     src: Path,
     dst: Path,
@@ -383,42 +376,76 @@ async def map_by_key_jsonl_file(
             tg.create_task(apply_f_proc())
 
 
-def _reconcile_flatmap_dst_from_resume_log(
+def _flatmap_line_resume_valid_prefix(
+    records: List[dict],
+) -> tuple[int, int]:
+    """
+    Scan *records* (in order) and return how many leading *dst* lines are committed
+    and the largest 1-based *src* line number fully done (0 if none). Consecutive
+    ``src_line`` values from 1 imply lines ``1 .. last`` are complete.
+
+    Each record is ``{"src_line": L, "dst_end": d}``: source line *L* is complete,
+    and *d* is one past the 1-based index of the last *dst* line produced so far
+    (unchanged from the previous record when *L* produced zero outputs). Records
+    must start at ``src_line`` 1 and increase by 1; ``dst_end`` must be non-decreasing.
+    The first invalid record ends the valid prefix.
+    """
+
+    prev_src: Optional[int] = None
+    prev_dst_end = 1
+
+    for rec in records:
+        s = rec["src_line"]
+        d = rec["dst_end"]
+        if s < 1 or d < 1:
+            break
+        if prev_src is None:
+            if s != 1:
+                break
+        elif s != prev_src + 1 or d < prev_dst_end:
+            break
+        prev_src = s
+        prev_dst_end = d
+
+    valid_dst_lines = prev_dst_end - 1
+    last_completed_src_line = prev_src or 0
+    return valid_dst_lines, last_completed_src_line
+
+
+def _reconcile_flatmap_line_resume_log(
     dst: Path,
     resume_log: Path,
     *,
-    key: str,
     progress: Optional[Callable[[bool], None]] = None,
-) -> set:
+) -> tuple[int, int]:
     """
-    Rebuild *dst* so it contains only output lines whose *key* value was recorded
-    in *resume_log* (one JSON value per line, same encoding as ``json.dumps``).
+    Truncate *dst* to the longest prefix consistent with *resume_log*.
 
-    After a crash, *dst* may contain trailing rows for keys that were not yet
-    appended to *resume_log*. This function drops those rows by rewriting *dst*
-    atomically (write a sibling ``*.flatmap_reconcile.tmp`` then ``os.replace``).
+    The resume log format is documented in a comment immediately above
+    ``flatmap_jsonl_file`` in this module.
 
-    Returns the set of key values found in *resume_log* (the keys considered
-    fully flushed from a previous run). Callers pass this to resume logic that
-    skips work for those keys.
+    After a crash, *dst* may contain lines past the committed ``dst_end`` implied by
+    the log; this function drops those rows by rewriting *dst* atomically (write a
+    sibling ``*.flatmap_reconcile.tmp`` then ``os.replace``).
 
-    If *resume_log* does not exist, it is treated as empty (no keys complete).
-    A stale ``*.flatmap_reconcile.tmp`` from an interrupted reconcile is removed.
+    Returns ``(last_completed_src_line, committed_dst_line_count)``: the largest
+    1-based source line number fully recorded in the valid prefix (0 if none), and
+    how many leading lines of *dst* are committed. If *resume_log* does not exist,
+    returns ``(0, 0)`` and leaves *dst* unchanged. A stale ``*.flatmap_reconcile.tmp``
+    from an interrupted reconcile is removed.
     """
 
     if not resume_log.exists():
-        return set()
+        return 0, 0
+
+    with resume_log.open("rt") as log_f:
+        records = [json.loads(line) for line in log_f]
+    valid_dst_lines, last_completed_src_line = _flatmap_line_resume_valid_prefix(
+        records
+    )
 
     if not dst.exists():
-        return set()
-
-    logged_keys: set = set()
-    with resume_log.open("rt") as log_f:
-        for line in log_f:
-            line = line.strip()
-            if not line:
-                continue
-            logged_keys.add(json.loads(line))
+        return last_completed_src_line, valid_dst_lines
 
     tmp_path = dst.with_suffix(dst.suffix + ".flatmap_reconcile.tmp")
     if tmp_path.exists():
@@ -427,16 +454,12 @@ def _reconcile_flatmap_dst_from_resume_log(
     replaced = False
     try:
         with dst.open("rt") as src_f, tmp_path.open("wt") as out_f:
+            kept = 0
             for line in src_f:
-                raw = line.rstrip("\n")
-                if not raw:
-                    continue
-                row = json.loads(raw)
-                row_key = row[key]
-                if row_key not in logged_keys:
-                    continue
-                out_f.write(raw)
-                out_f.write("\n")
+                if kept >= valid_dst_lines:
+                    break
+                out_f.write(line)
+                kept += 1
                 if progress is not None:
                     progress(True)
         os.replace(tmp_path, dst)
@@ -445,26 +468,33 @@ def _reconcile_flatmap_dst_from_resume_log(
         if not replaced and tmp_path.exists():
             tmp_path.unlink()
 
-    return logged_keys
+    return last_completed_src_line, valid_dst_lines
 
 
-async def flatmap_by_key_jsonl_file(
+# Resume log (JSONL): one record per completed source line L (1-based physical line in src):
+#   {"src_line": L, "dst_end": d}
+# where *d* is one past the 1-based line index of the last row written to dst after
+# finishing *L* (same *d* as the previous record if f returned []). Appended only after
+# all outputs for *L* are written and flushed.
+async def flatmap_jsonl_file(
     src: Path,
     dst: Path,
     resume_log: Path,
     f: Callable[[dict], Awaitable[List[dict]]],
     *,
-    key: str,
     num_concurrent: int,
     on_error: OnError,
     progress: Optional[Callable[[bool], None]] = None,
 ):
     """
-    Apply an async transformation to each row in *src*, where the transformation
-    can produce multiple output rows per input row.
+    Apply an async transformation to each non-empty JSON line in *src*, where the
+    transformation can produce multiple output rows per input line.
 
-    **IMPORTANT**: Keys must be unique in *src*. Each row must have a distinct
-    value for *key*.
+    **IMPORTANT**: *src* must not change between runs (line numbers identify rows).
+
+    Source line numbers are **1-based** physical lines in *src* (every line read
+    from the file, including lines that are skipped as already completed). The
+    resume log format is described in a comment above this function.
 
     ### Parameters
 
@@ -472,8 +502,7 @@ async def flatmap_by_key_jsonl_file(
      - `resume_log : Path`: used to support resumption.
      - `f : Callable[[dict], Awaitable[List[dict]]]`: async function invoked once
        per row. Returns a list of dicts; each dict is written to *dst* as one JSON
-       line (include any fields you need from *row* in each dict).
-     - `key : str`: column that uniquely identifies each row in *src*.
+       line.
      - `num_concurrent : int`: maximum number of concurrent invocations of *f*.
      - `on_error : Literal["print", "raise"]`: how to handle errors from *f*.
      - `progress`: an optional function that is called after each output row is written
@@ -481,14 +510,12 @@ async def flatmap_by_key_jsonl_file(
        indicating success (True) or failure (False). During reconciliation it is
        called with True for each row retained when rebuilding *dst* from *resume_log*.
 
-    ### Behaviour
+    ### Behavior
 
-    - Each row in *src* is passed to *f*, which returns a list of dicts.
+    - Each parsed row in *src* is passed to *f*, which returns a list of dicts.
     - Each dict is serialized as one line of *dst* with ``sort_keys=True`` (no merging with *src*).
-    - If *f* returns an empty list, no output rows are written for that input row;
-      the key is still recorded in *resume_log* so that row is not retried.
-    - On each run, :func:`reconcile_flatmap_dst_from_resume_log` is applied first
-      so *dst* matches *resume_log*; keys listed in the log are skipped when reading *src*.
+    - If *f* returns an empty list, no output rows are written for that input line;
+      it is still marked complete in the resume log so that line is not retried.
 
     ### Example
 
@@ -509,12 +536,11 @@ async def flatmap_by_key_jsonl_file(
              {"key": row["key"], "other": row["other"], "result": row["key"] + 2},
          ]
 
-     await flatmap_by_key_jsonl_file(
+     await flatmap_jsonl_file(
          src,
          dst,
          Path("out.resume.jsonl"),
          f=compute,
-         key="key",
          on_error="raise",
          num_concurrent=1,
      )
@@ -530,10 +556,10 @@ async def flatmap_by_key_jsonl_file(
      ```
     """
 
-    # Source-row keys already finished in a prior run (see resume_log); skipped on read.
-    completed_keys = _reconcile_flatmap_dst_from_resume_log(
-        dst, resume_log, key=key, progress=progress
+    last_completed_src_line, committed_dst_lines = _reconcile_flatmap_line_resume_log(
+        dst, resume_log, progress=progress
     )
+    dst_exclusive_end = committed_dst_lines + 1
 
     # Backpressure: full source rows waiting for apply_f_proc; bound so we do not read
     # the entire JSONL into memory when f is slow.
@@ -541,15 +567,16 @@ async def flatmap_by_key_jsonl_file(
 
     # A queue of lines read from src. We use a queue to avoid reading the whole
     # file into memory.
-    f_args_buffer = asyncio.Queue(MAX_SRC_LINES_TO_HOLD_IN_MEMORY)
+    f_args_buffer: asyncio.Queue[Optional[tuple[int, dict]]] = asyncio.Queue(
+        MAX_SRC_LINES_TO_HOLD_IN_MEMORY
+    )
 
-    # f_results[key] is a future that holds the result of applying f to the row
-    # with that key.
-    f_results: Dict[str, asyncio.Future[List[dict]]] = {}
+    # f_results[src_line_no] is a future that holds the result of applying f to that line.
+    f_results: Dict[int, asyncio.Future[List[dict]]] = {}
 
-    # Source keys in file order; write_dst_proc consumes these to align output with src
-    # and to await the matching Future after apply_f_proc completes.
-    dst_rows_buffer = asyncio.Queue()
+    # 1-based source line numbers in file order; write_dst_proc consumes these to align
+    # output with src and to await the matching Future after apply_f_proc completes.
+    dst_rows_buffer: asyncio.Queue[Optional[int]] = asyncio.Queue()
 
     def _progress(success: bool):
         """Shim so we only call the user progress hook when it is configured."""
@@ -558,63 +585,65 @@ async def flatmap_by_key_jsonl_file(
 
     async def read_src_proc():
         with src.open("rt") as fp:
+            line_no = 0
             for line in fp:
-                row = json.loads(line)
-                row_key = row[key]  # identifies this source row; keys f_results and resume_log
-
-                # Skip keys that were already processed (from resume_log)
-                if row_key in completed_keys:
+                line_no += 1
+                if line_no <= last_completed_src_line:
                     continue
 
-                f_results[row_key] = asyncio.Future()
-                # Hand the full source row to apply_f_proc (bounded queue).
-                await f_args_buffer.put(row)
-
-                # Same key order here as output order from write_dst_proc (src row order).
-                await dst_rows_buffer.put(row_key)
+                row = json.loads(line)
+                f_results[line_no] = asyncio.Future()
+                await f_args_buffer.put((line_no, row))
+                await dst_rows_buffer.put(line_no)
 
             await dst_rows_buffer.put(None)
             for _ in range(num_concurrent):
                 await f_args_buffer.put(None)
 
     async def write_dst_proc():
+        nonlocal dst_exclusive_end
+
         with dst.open("at") as dst_f, resume_log.open("at") as log_f:
             while True:
-                row_key = await dst_rows_buffer.get()
-                if row_key is None:
+                src_line_no = await dst_rows_buffer.get()
+                if src_line_no is None:
                     break
                 try:
-                    f_result_list = await f_results[row_key]
+                    f_result_list = await f_results[src_line_no]
                 except Exception:
                     _progress(False)
                     continue
 
-                # One JSON object per line in dst for this source row.
                 for f_result in f_result_list:
                     json.dump(f_result, dst_f, sort_keys=True)
                     dst_f.write("\n")
                     dst_f.flush()
                     _progress(True)
+                    dst_exclusive_end += 1
 
-                log_f.write(json.dumps(row_key) + "\n")
+                log_f.write(
+                    json.dumps(
+                        {"dst_end": dst_exclusive_end, "src_line": src_line_no},
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
                 log_f.flush()
 
     async def apply_f_proc():
         while True:
-            row = await f_args_buffer.get()
-            if row is None:
+            item = await f_args_buffer.get()
+            if item is None:
                 break
-            row_key = row[key]
-            f_slot = f_results[row_key]
+            src_line_no, row = item
+            f_slot = f_results[src_line_no]
             try:
                 result = await f(row)
                 f_slot.set_result(result)
             except Exception as e:
-                # write_dst_proc sees this when awaiting f_results[row_key].
                 f_slot.set_exception(e)
                 _error(on_error, f"Error applying f to {row}: {e}")
 
-    # Reader and writer are single tasks; apply_f runs with bounded concurrency.
     async with asyncio.TaskGroup() as tg:
         tg.create_task(read_src_proc())
         tg.create_task(write_dst_proc())
