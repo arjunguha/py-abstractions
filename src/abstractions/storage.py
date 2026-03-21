@@ -487,73 +487,32 @@ async def flatmap_jsonl_file(
     progress: Optional[Callable[[bool], None]] = None,
 ):
     """
-    Apply an async transformation to each non-empty JSON line in *src*, where the
-    transformation can produce multiple output rows per input line.
+    `flatmap_jsonl_file` applies *f* to each JSON line in *src* to produce the
+    JSONL file *dst*, as well as a *resume_log* file that allows it to resume an
+    interrupted run. *f* may produce zero or more outputs for each input line,
+    which allows behaviors such as filtering by outputing zero items on certain
+    inputs. Moreover, *f* must be asynchronous, which allows this function to
+    run *f* on several lines concurrently.
 
-    **IMPORTANT**: *src* must not change between runs (line numbers identify rows).
-
-    Source line numbers are **1-based** physical lines in *src* (every line read
-    from the file, including lines that are skipped as already completed). The
-    resume log format is described in a comment above this function.
+    `flatmap_jsonl_file` ensures that the results follow the same order as
+    the input.
+    
+    For resumption to work, the *src* file must not change between runs.
 
     ### Parameters
 
      - `src, dst : Path`: source and destination JSONL files.
      - `resume_log : Path`: used to support resumption.
-     - `f : Callable[[dict], Awaitable[List[dict]]]`: async function invoked once
-       per row. Returns a list of dicts; each dict is written to *dst* as one JSON
-       line.
+     - `f : Callable[[dict], Awaitable[List[dict]]]`: async function invoked
+       once per row. Returns a list of dicts; each dict is written to *dst* as
+       one JSON line.
      - `num_concurrent : int`: maximum number of concurrent invocations of *f*.
      - `on_error : Literal["print", "raise"]`: how to handle errors from *f*.
-     - `progress`: an optional function that is called after each output row is written
-       to *dst* (or once per input row on failure). The function receives a boolean
-       indicating success (True) or failure (False). During reconciliation it is
-       called with True for each row retained when rebuilding *dst* from *resume_log*.
-
-    ### Behavior
-
-    - Each parsed row in *src* is passed to *f*, which returns a list of dicts.
-    - Each dict is serialized as one line of *dst* with ``sort_keys=True`` (no merging with *src*).
-    - If *f* returns an empty list, no output rows are written for that input line;
-      it is still marked complete in the resume log so that line is not retried.
-
-    ### Example
-
-     Consider the following input file:
-
-     ```jsonl
-     { "key": 10, "other": "A", "discarded": "X" }
-     { "key": 20, "other": "B", "discarded": "Y" }
-     ```
-
-     Consider the following application (inside an async context):
-
-     ```python
-     async def compute(row):
-         # Returns multiple results per row; copy fields from *row* as needed.
-         return [
-             {"key": row["key"], "other": row["other"], "result": row["key"] + 1},
-             {"key": row["key"], "other": row["other"], "result": row["key"] + 2},
-         ]
-
-     await flatmap_jsonl_file(
-         src,
-         dst,
-         Path("out.resume.jsonl"),
-         f=compute,
-         on_error="raise",
-         num_concurrent=1,
-     )
-     ```
-
-     The output file *dst* will be a permutation of:
-
-     ```jsonl
-     { "key": 10, "result": 11, "other": "A" }
-     { "key": 10, "result": 12, "other": "A" }
-     { "key": 20, "result": 21, "other": "B" }
-     { "key": 20, "result": 22, "other": "B" }
-     ```
+     - `progress`: an optional function that is called after each output row is
+       written to *dst* (or once per input row on failure). The function
+       receives a boolean indicating success (True) or failure (False). During
+       reconciliation it is called with True for each row retained when
+       rebuilding *dst* from *resume_log*.
     """
 
     last_completed_src_line, committed_dst_lines = _reconcile_flatmap_line_resume_log(
