@@ -24,11 +24,16 @@ def batches(
     batch = []
     dataset_len = None
     for i in range(epochs):
+        j = -1
+        produced_item = False
         for j, item in enumerate(iterable):
+            produced_item = True
             batch.append(item)
             if len(batch) == batch_size:
                 yield batch
                 batch = []
+        if not produced_item:
+            break
         if dataset_len is None:
             dataset_len = j + 1
         elif j + 1 < dataset_len:

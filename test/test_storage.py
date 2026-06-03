@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Tuple, AsyncIterator, Awaitable, Callable
 import asyncio
 import pytest
+from typing_extensions import override
 
 from abstractions.storage import (
     create_or_resume_jsonl_file,
@@ -198,10 +199,12 @@ class EqualityRaisingClass:
     
     def __init__(self, value):
         self.value = value
-    
+
+    @override
     def __eq__(self, other):
         raise RuntimeError("Equality check should not be called")
-    
+
+    @override
     def __ne__(self, other):
         raise RuntimeError("Inequality check should not be called")
 

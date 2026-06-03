@@ -13,6 +13,9 @@ dependencies = []
 pythonpath = ["src"]
 asyncio_default_fixture_loop_scope = "function"
 
+[tool.ty.rules]
+all = "error"
+
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9"]
 build-backend = "uv_build"
@@ -24,4 +27,6 @@ dev = [
     "mkdocstrings[python]>=0.29.1",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
+    "typing-extensions>=4.15.0",
+    "ty>=0.0.42",
 ]

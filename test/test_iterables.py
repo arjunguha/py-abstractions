@@ -28,6 +28,12 @@ def test_batches_with_generator_single_consumption():
     assert result == [[0, 1], [2, 3], [4]]
 
 
+def test_batches_with_empty_iterable():
+    result = list(batches([], batch_size=2, epochs=2))
+
+    assert result == []
+
+
 def test_batches_with_list_leftover_across_epochs():
     """When the iterable length is not divisible by batch_size, the leftover from the
     first epoch should be filled by items from the next epoch before being yielded."""
