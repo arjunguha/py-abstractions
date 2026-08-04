@@ -109,11 +109,60 @@ object itself. The process that creates an actor owns its subprocess and shuts
 it down when that creating process exits; deleting or transferring an
 individual reference does not stop the actor.
 
+## Creating actors from actors
+
+Actors can construct and return other actors. The newly created actor is owned
+by the actor process that created it.
+
+```python
+@actor
+class Spawner:
+    async def make_counter(self, initial: int) -> ActorRef[Any]:
+        return Counter(initial)
+
+
+async def main() -> None:
+    spawner = Spawner()
+    counter = await spawner.make_counter(10)
+
+    assert await counter.add(5) == 15
+```
+
+## Lifetime and termination
+
+An actor remains alive until either:
+
+- `await terminate(actor_ref)` explicitly terminates it; or
+- the process that created it exits.
+
+Termination is graceful: the actor finishes its current method call, closes its
+listener, and terminates actors that it created. Ownership is recursive, so
+terminating the `Spawner` above also terminates its counter. `terminate` is
+idempotent and accepts any reference to the actor.
+
+```python
+from abstractions import ActorDiedError, terminate
+
+
+await terminate(counter)
+
+try:
+    await counter.add()
+except ActorDiedError:
+    print("the actor is no longer running")
+```
+
+Deleting an `ActorRef` does not terminate its actor. This is necessary because
+other processes may still hold transferred copies of that reference.
+
 ## Errors and serialization
 
 Constructor errors are raised immediately when the decorated class is called.
 Exceptions from actor methods are raised when the method call is awaited and
 include the remote traceback as an exception note.
+
+A method call to an explicitly terminated, crashed, or otherwise unreachable
+actor raises `ActorDiedError`, which is a subclass of `ActorError`.
 
 Arguments, return values, actor classes, and actor references are serialized
 with `cloudpickle`. A value that cannot be serialized causes an `ActorError`.
