@@ -7,7 +7,6 @@ on the returned :class:`ActorRef`.
 
 from __future__ import annotations
 
-import atexit
 import asyncio
 import inspect
 import multiprocessing
@@ -16,6 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from multiprocessing.connection import Client, Connection, Listener
 from multiprocessing.context import SpawnProcess
+from multiprocessing.util import Finalize
 from typing import Any, Generic, Protocol, TypeVar, cast
 
 import cloudpickle
@@ -26,7 +26,7 @@ T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
 AsyncMethod = Callable[..., Awaitable[Any]]
 Address = tuple[str, int]
-_owned_processes: set[SpawnProcess] = set()
+_owned_processes: dict[Address, SpawnProcess] = {}
 
 
 class ActorClass(Protocol[T_co]):
@@ -42,6 +42,10 @@ class ActorClass(Protocol[T_co]):
 
 class ActorError(RuntimeError):
     """Raised when an actor cannot start or communicate."""
+
+
+class ActorDiedError(ActorError):
+    """Raised when a method call targets an actor that is no longer running."""
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,12 @@ class _Failure:
     exception: BaseException
 
 
+@dataclass(frozen=True)
+class _Terminate:
+    pass
+
+
+_Request = _Call | _Terminate
 _Response = _Result | _Failure
 
 
@@ -98,16 +108,37 @@ def _exposed_methods(cls: type[object]) -> frozenset[str]:
     return frozenset(exposed)
 
 
+def _terminate_at_address(address: Address) -> None:
+    try:
+        with Client(address) as connection:
+            _send(connection, _Terminate())
+            try:
+                connection.recv_bytes()
+            except EOFError:
+                pass
+    except OSError:
+        pass
+
+
 def _terminate_owned_processes() -> None:
-    for process in _owned_processes:
+    owned_processes = tuple(_owned_processes.items())
+    for address, process in owned_processes:
         if process.is_alive():
-            process.terminate()
-    for process in _owned_processes:
+            _terminate_at_address(address)
+    for _, process in owned_processes:
         process.join()
     _owned_processes.clear()
 
 
-atexit.register(_terminate_owned_processes)
+_process_finalizer = Finalize(
+    None,
+    _terminate_owned_processes,
+    exitpriority=10,
+)
+
+
+def _register_owned_process(address: Address, process: SpawnProcess) -> None:
+    _owned_processes[address] = process
 
 
 class ActorRef(Generic[T_co]):
@@ -166,8 +197,8 @@ class ActorRef(Generic[T_co]):
                 connection.send_bytes(request_data)
                 response = cast(_Response, _receive(connection))
         except (EOFError, OSError) as exception:
-            raise ActorError(
-                f"Could not call actor at {self._address[0]}:{self._address[1]}"
+            raise ActorDiedError(
+                f"Actor at {self._address[0]}:{self._address[1]} is not running"
             ) from exception
 
         if isinstance(response, _Failure):
@@ -222,7 +253,9 @@ async def _serve_actor(
 
             with connection:
                 try:
-                    request = cast(_Call, _receive(connection))
+                    request = cast(_Request, _receive(connection))
+                    if isinstance(request, _Terminate):
+                        return
                     if not isinstance(request, _Call) or request.method not in methods:
                         raise ActorError("Received a call to an unexposed actor method")
                     method = cast(
@@ -245,6 +278,24 @@ async def _serve_actor(
                         f"Could not serialize actor response: {exception}"
                     )
                     _send(connection, _Failure(fallback))
+
+
+async def terminate(actor_ref: ActorRef[object]) -> None:
+    """Terminate an actor and all actors that it owns.
+
+    The operation is idempotent. Calls through any reference to the terminated
+    actor subsequently raise :class:`ActorDiedError`.
+    """
+
+    await asyncio.to_thread(_terminate_ref, actor_ref)
+
+
+def _terminate_ref(actor_ref: ActorRef[object]) -> None:
+    address = actor_ref._address
+    _terminate_at_address(address)
+    process = _owned_processes.pop(address, None)
+    if process is not None:
+        process.join()
 
 
 def actor(cls: type[T]) -> ActorClass[T]:
@@ -290,8 +341,9 @@ def actor(cls: type[T]) -> ActorClass[T]:
             process.join()
             raise ActorError("Actor returned an invalid startup response")
 
-        _owned_processes.add(process)
-        return ActorRef(cast(Address, startup_response.value), methods)
+        address = cast(Address, startup_response.value)
+        _register_owned_process(address, process)
+        return ActorRef(address, methods)
 
     create_actor.__name__ = cls.__name__
     create_actor.__qualname__ = cls.__qualname__

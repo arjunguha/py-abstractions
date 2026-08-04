@@ -8,7 +8,7 @@ from typing import Any, cast
 
 import pytest
 
-from abstractions import ActorError, ActorRef, actor
+from abstractions import ActorDiedError, ActorError, ActorRef, actor, terminate
 
 
 @actor
@@ -75,6 +75,15 @@ class BadResult:
         import threading
 
         return threading.Lock()
+
+
+@actor
+class Spawner:
+    async def spawn_counter(self, initial: int) -> ActorRef[Any]:
+        return Counter(initial)
+
+    async def process_id(self) -> int:
+        return os.getpid()
 
 
 def _collect_actor(ref: ActorRef[Any]) -> None:
@@ -217,3 +226,30 @@ async def test_transferred_ref_survives_original_ref_deletion() -> None:
     gc.collect()
 
     assert await transferred.add(2) == 12
+
+
+@pytest.mark.asyncio
+async def test_actor_can_spawn_an_actor_and_owns_its_lifetime() -> None:
+    spawner = Spawner()
+    child = cast(ActorRef[Any], await spawner.spawn_counter(20))
+
+    assert await child.add(2) == 22
+    assert await child.process_id() != await spawner.process_id()
+
+    await terminate(spawner)
+
+    with pytest.raises(ActorDiedError, match="is not running"):
+        await spawner.process_id()
+    with pytest.raises(ActorDiedError, match="is not running"):
+        await child.add()
+
+
+@pytest.mark.asyncio
+async def test_terminate_is_idempotent_and_calls_raise_actor_died_error() -> None:
+    counter = Counter()
+
+    await terminate(counter)
+    await terminate(counter)
+
+    with pytest.raises(ActorDiedError, match="is not running"):
+        await counter.add()
