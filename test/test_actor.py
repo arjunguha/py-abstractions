@@ -107,9 +107,6 @@ async def test_construction_and_async_method_calls() -> None:
 async def test_only_public_async_methods_are_exposed() -> None:
     counter = Counter()
     try:
-        assert await counter.static_value(3) == 4
-        assert await counter.class_method() == 42
-
         with pytest.raises(AttributeError):
             getattr(counter, "value")
         with pytest.raises(AttributeError):
@@ -120,6 +117,10 @@ async def test_only_public_async_methods_are_exposed() -> None:
             getattr(counter, "synchronous")
         with pytest.raises(AttributeError):
             getattr(counter, "missing")
+        with pytest.raises(AttributeError):
+            getattr(counter, "static_value")
+        with pytest.raises(AttributeError):
+            getattr(counter, "class_method")
     finally:
         _collect_actor(counter)
 
