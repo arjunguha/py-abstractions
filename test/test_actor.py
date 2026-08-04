@@ -254,3 +254,16 @@ async def test_terminate_is_idempotent_and_calls_raise_actor_died_error() -> Non
 
     with pytest.raises(ActorDiedError, match="is not running"):
         await counter.add()
+
+
+@pytest.mark.asyncio
+async def test_actor_uses_and_cleans_up_unix_socket() -> None:
+    counter = Counter()
+    address, _ = counter.__getstate__()
+
+    assert address.endswith("/actor.sock")
+    assert os.path.exists(address)
+
+    await terminate(counter)
+
+    assert not os.path.exists(os.path.dirname(address))
