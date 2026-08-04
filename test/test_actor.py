@@ -3,7 +3,6 @@ import gc
 import inspect
 import os
 import pickle
-import time
 from typing import Any, cast
 
 import pytest
@@ -18,39 +17,39 @@ class Counter:
     def __init__(self, initial: int = 0) -> None:
         self.value = initial
 
-    def add(self, amount: int = 1) -> int:
+    async def add(self, amount: int = 1) -> int:
         self.value += amount
         return self.value
 
-    def process_id(self) -> int:
+    async def process_id(self) -> int:
         return os.getpid()
 
-    def fail(self, message: str) -> None:
+    async def fail(self, message: str) -> None:
         raise ValueError(message)
 
-    def _private(self) -> str:
+    async def _private(self) -> str:
         return "private"
 
-    async def asynchronous(self) -> str:
-        return "async"
+    def synchronous(self) -> str:
+        return "sync"
 
     @property
     def doubled(self) -> int:
         return self.value * 2
 
     @staticmethod
-    def static_value(value: int) -> int:
+    async def static_value(value: int) -> int:
         return value + 1
 
     @classmethod
-    def class_method(cls) -> int:
+    async def class_method(cls) -> int:
         return cls.class_value + 2
 
 
 @actor
 class Forwarder:
-    def add_via(self, target: ActorRef[Any], amount: int) -> int:
-        result = asyncio.run(target.add(amount))
+    async def add_via(self, target: ActorRef[Any], amount: int) -> int:
+        result = await target.add(amount)
         return cast(int, result)
 
 
@@ -59,16 +58,16 @@ class SlowCounter:
     def __init__(self) -> None:
         self.value = 0
 
-    def increment(self) -> int:
+    async def increment(self) -> int:
         old_value = self.value
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
         self.value = old_value + 1
         return self.value
 
 
 @actor
 class BadResult:
-    def lock(self) -> object:
+    async def lock(self) -> object:
         import threading
 
         return threading.Lock()
@@ -92,7 +91,7 @@ async def test_construction_and_async_method_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_public_synchronous_methods_are_exposed() -> None:
+async def test_only_public_async_methods_are_exposed() -> None:
     counter = Counter()
     try:
         assert await counter.static_value(3) == 4
@@ -105,7 +104,7 @@ async def test_only_public_synchronous_methods_are_exposed() -> None:
         with pytest.raises(AttributeError):
             getattr(counter, "_private")
         with pytest.raises(AttributeError):
-            getattr(counter, "asynchronous")
+            getattr(counter, "synchronous")
         with pytest.raises(AttributeError):
             getattr(counter, "missing")
     finally:
@@ -163,7 +162,7 @@ def test_constructor_exceptions_are_raised_immediately() -> None:
         def __init__(self) -> None:
             raise RuntimeError("broken constructor")
 
-        def unused(self) -> None:
+        async def unused(self) -> None:
             return None
 
     with pytest.raises(RuntimeError, match="broken constructor"):
@@ -174,7 +173,7 @@ def test_constructor_exceptions_are_raised_immediately() -> None:
 async def test_local_actor_classes_work_with_spawn() -> None:
     @actor
     class Local:
-        def echo(self, value: str) -> str:
+        async def echo(self, value: str) -> str:
             return value
 
     local = Local()

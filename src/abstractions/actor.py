@@ -1,8 +1,8 @@
 """Small, subprocess-backed actors.
 
 Decorating a class with :func:`actor` replaces the class with a callable that
-starts an instance in a spawned subprocess. Public synchronous methods become
-asynchronous methods on the returned :class:`ActorRef`.
+starts an instance in a spawned subprocess. Public async methods are available
+on the returned :class:`ActorRef`.
 """
 
 from __future__ import annotations
@@ -90,9 +90,7 @@ def _exposed_methods(cls: type[object]) -> frozenset[str]:
         else:
             function = descriptor
 
-        if not inspect.isfunction(function):
-            continue
-        if inspect.iscoroutinefunction(function) or inspect.isasyncgenfunction(function):
+        if not inspect.iscoroutinefunction(function):
             continue
         exposed.add(name)
     return frozenset(exposed)
@@ -196,10 +194,18 @@ def _actor_process(
         startup.close()
 
     assert listener is not None
+    asyncio.run(_serve_actor(listener, instance, methods))
+
+
+async def _serve_actor(
+    listener: Listener,
+    instance: object,
+    methods: frozenset[str],
+) -> None:
     with listener:
         while True:
             try:
-                connection = listener.accept()
+                connection = await asyncio.to_thread(listener.accept)
             except (OSError, EOFError):
                 return
 
@@ -208,8 +214,8 @@ def _actor_process(
                     request = cast(_Call, _receive(connection))
                     if not isinstance(request, _Call) or request.method not in methods:
                         raise ActorError("Received a call to an unexposed actor method")
-                    method = cast(Callable[..., object], getattr(instance, request.method))
-                    value = method(*request.args, **request.kwargs)
+                    method = cast(Callable[..., Awaitable[object]], getattr(instance, request.method))
+                    value = await method(*request.args, **request.kwargs)
                     response: _Response = _Result(value)
                 except BaseException as exception:
                     exception.add_note(
@@ -230,7 +236,7 @@ def _actor_process(
 def actor(cls: type[T]) -> ActorClass[T]:
     """Run instances of ``cls`` as actors in spawned subprocesses.
 
-    Only public synchronous methods are exposed. Construction starts the
+    Only public async methods are exposed. Construction starts the
     subprocess immediately and returns once ``cls.__init__`` has completed.
     """
 
