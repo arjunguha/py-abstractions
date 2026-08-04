@@ -32,7 +32,8 @@ async def main() -> None:
     assert await counter.process_id() != os.getpid()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ## Exposed methods
@@ -104,7 +105,9 @@ async def main() -> None:
 
 The caller must be able to reach the process that owns the target actor. Actor
 references contain a local multiprocessing connection endpoint, not the actor
-object itself.
+object itself. The process that creates an actor owns its subprocess and shuts
+it down when that creating process exits; deleting or transferring an
+individual reference does not stop the actor.
 
 ## Errors and serialization
 
