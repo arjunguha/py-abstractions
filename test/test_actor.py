@@ -3,6 +3,7 @@ import gc
 import inspect
 import os
 import pickle
+import threading
 from typing import Any, cast
 
 import pytest
@@ -26,6 +27,9 @@ class Counter:
 
     async def fail(self, message: str) -> None:
         raise ValueError(message)
+
+    async def echo(self, value: object) -> object:
+        return value
 
     async def _private(self) -> str:
         return "private"
@@ -191,3 +195,24 @@ async def test_unserializable_results_raise_actor_error() -> None:
             await actor_ref.lock()
     finally:
         _collect_actor(actor_ref)
+
+
+@pytest.mark.asyncio
+async def test_unserializable_arguments_raise_actor_error() -> None:
+    counter = Counter()
+    try:
+        with pytest.raises(ActorError, match="Could not serialize actor request"):
+            await counter.echo(threading.Lock())
+    finally:
+        _collect_actor(counter)
+
+
+@pytest.mark.asyncio
+async def test_transferred_ref_survives_original_ref_deletion() -> None:
+    original = Counter(10)
+    transferred = cast(ActorRef[Any], pickle.loads(pickle.dumps(original)))
+
+    del original
+    gc.collect()
+
+    assert await transferred.add(2) == 12
