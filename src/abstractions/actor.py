@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import multiprocessing
+import tempfile
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from typing_extensions import override
 T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
 AsyncMethod = Callable[..., Awaitable[Any]]
-Address = tuple[str, int]
+Address = str
 _owned_processes: dict[Address, SpawnProcess] = {}
 
 
@@ -105,7 +106,7 @@ def _exposed_methods(cls: type[object]) -> frozenset[str]:
 
 def _terminate_at_address(address: Address) -> None:
     try:
-        with Client(address) as connection:
+        with Client(address, family="AF_UNIX") as connection:
             _send(connection, _Terminate())
             try:
                 connection.recv_bytes()
@@ -173,8 +174,7 @@ class ActorRef(Generic[T_co]):
 
     @override
     def __repr__(self) -> str:
-        host, port = self._address
-        return f"ActorRef(address={host}:{port})"
+        return f"ActorRef(address={self._address})"
 
     def _call(
         self,
@@ -188,13 +188,11 @@ class ActorRef(Generic[T_co]):
             raise ActorError("Could not serialize actor request") from exception
 
         try:
-            with Client(self._address) as connection:
+            with Client(self._address, family="AF_UNIX") as connection:
                 connection.send_bytes(request_data)
                 response = cast(_Response, _receive(connection))
         except (EOFError, OSError) as exception:
-            raise ActorDiedError(
-                f"Actor at {self._address[0]}:{self._address[1]} is not running"
-            ) from exception
+            raise ActorDiedError(f"Actor at {self._address} is not running") from exception
 
         if isinstance(response, _Failure):
             raise response.exception
@@ -210,28 +208,38 @@ def _actor_process(
     methods: frozenset[str],
     startup: Connection,
 ) -> None:
-    listener: Listener | None = None
     try:
         cls = cast(type[object], _deserialize(class_data))
         args = cast(tuple[object, ...], _deserialize(args_data))
         kwargs = cast(dict[str, object], _deserialize(kwargs_data))
         instance = cls(*args, **kwargs)
-        listener = Listener(
-            ("127.0.0.1", 0),
-            family="AF_INET",
-            backlog=128,
-        )
-        address = cast(Address, listener.address)
-        _send(startup, _Result(address))
     except BaseException as exception:
         exception.add_note("The actor failed during initialization")
         _send(startup, _Failure(exception))
-        return
-    finally:
         startup.close()
+        return
 
-    assert listener is not None
-    asyncio.run(_serve_actor(listener, instance, methods))
+    with tempfile.TemporaryDirectory(prefix="abstractions-actor-") as socket_dir:
+        address = f"{socket_dir}/actor.sock"
+        listener: Listener | None = None
+        try:
+            listener = Listener(
+                address,
+                family="AF_UNIX",
+                backlog=128,
+            )
+            _send(startup, _Result(address))
+        except BaseException as exception:
+            if listener is not None:
+                listener.close()
+            exception.add_note("The actor failed while opening its socket")
+            _send(startup, _Failure(exception))
+            return
+        finally:
+            startup.close()
+
+        assert listener is not None
+        asyncio.run(_serve_actor(listener, instance, methods))
 
 
 async def _serve_actor(

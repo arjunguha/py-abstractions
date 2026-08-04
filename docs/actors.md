@@ -2,7 +2,9 @@
 
 The `actor` decorator runs each decorated object in its own spawned subprocess.
 Constructing the decorated class starts the subprocess immediately and returns
-an `ActorRef`; there is no separate start or initialization step.
+an `ActorRef`; there is no separate start or initialization step. Actors
+communicate over local Unix domain sockets, so this API supports Unix-like
+operating systems.
 
 ```python
 import asyncio
@@ -105,10 +107,11 @@ async def main() -> None:
 ```
 
 The caller must be able to reach the process that owns the target actor. Actor
-references contain a local multiprocessing connection endpoint, not the actor
+references contain the path of a private Unix domain socket, not the actor
 object itself. The process that creates an actor owns its subprocess and shuts
-it down when that creating process exits; deleting or transferring an
-individual reference does not stop the actor.
+it down when that creating process exits; deleting or transferring an individual
+reference does not stop the actor. The socket and its temporary directory are
+removed when the actor exits.
 
 ## Creating actors from actors
 
