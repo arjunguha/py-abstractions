@@ -1,8 +1,8 @@
 """Small, subprocess-backed actors.
 
 Decorating a class with :func:`actor` replaces the class with a callable that
-starts an instance in a spawned subprocess. Public async methods are available
-on the returned :class:`ActorRef`.
+starts an instance in a spawned subprocess. Public instance methods are
+available on the returned :class:`ActorRef`.
 """
 
 from __future__ import annotations
@@ -74,6 +74,12 @@ _Request = _Call | _Terminate
 _Response = _Result | _Failure
 
 
+@dataclass(frozen=True)
+class _ExposedMethods:
+    all: frozenset[str]
+    asynchronous: frozenset[str]
+
+
 def _serialize(value: object) -> bytes:
     return cloudpickle.dumps(value)
 
@@ -90,17 +96,20 @@ def _receive(connection: Connection) -> object:
     return _deserialize(connection.recv_bytes())
 
 
-def _exposed_methods(cls: type[object]) -> frozenset[str]:
+def _exposed_methods(cls: type[object]) -> _ExposedMethods:
     exposed: set[str] = set()
+    asynchronous: set[str] = set()
     for name, descriptor in inspect.getmembers_static(cls):
         if name.startswith("_"):
             continue
         if isinstance(descriptor, (staticmethod, classmethod)):
             continue
-        if not inspect.iscoroutinefunction(descriptor):
+        if not inspect.isfunction(descriptor):
             continue
         exposed.add(name)
-    return frozenset(exposed)
+        if inspect.iscoroutinefunction(descriptor):
+            asynchronous.add(name)
+    return _ExposedMethods(frozenset(exposed), frozenset(asynchronous))
 
 
 def _terminate_at_address(address: Address) -> None:
@@ -139,8 +148,9 @@ def _register_owned_process(address: Address, process: SpawnProcess) -> None:
 class ActorRef(Generic[T_co]):
     """A pickleable reference to an object living in another process.
 
-    Actor methods are resolved dynamically. Every resolved method is an async
-    callable and every call executes on the actor's single subprocess.
+    Actor methods are resolved dynamically. Every resolved method is called
+    asynchronously, regardless of whether its implementation is synchronous or
+    asynchronous.
     """
 
     def __init__(
@@ -207,7 +217,7 @@ def _actor_process(
     class_data: bytes,
     args_data: bytes,
     kwargs_data: bytes,
-    methods: frozenset[str],
+    methods: _ExposedMethods,
     startup: Connection,
 ) -> None:
     listener: Listener | None = None
@@ -237,42 +247,121 @@ def _actor_process(
 async def _serve_actor(
     listener: Listener,
     instance: object,
-    methods: frozenset[str],
+    methods: _ExposedMethods,
 ) -> None:
+    method_lock = _MethodLock()
+    calls: set[asyncio.Task[None]] = set()
+
     with listener:
         while True:
             try:
                 connection = await asyncio.to_thread(listener.accept)
             except (OSError, EOFError):
+                await asyncio.gather(*calls)
                 return
 
-            with connection:
-                try:
-                    request = cast(_Request, _receive(connection))
-                    if isinstance(request, _Terminate):
-                        return
-                    if not isinstance(request, _Call) or request.method not in methods:
-                        raise ActorError("Received a call to an unexposed actor method")
-                    method = cast(
-                        Callable[..., Awaitable[object]],
-                        getattr(instance, request.method),
-                    )
-                    value = await method(*request.args, **request.kwargs)
-                    response: _Response = _Result(value)
-                except BaseException as exception:
-                    exception.add_note(
-                        "Remote actor traceback:\n"
-                        + "".join(traceback.format_exception(exception))
-                    )
-                    response = _Failure(exception)
+            try:
+                request = cast(_Request, await asyncio.to_thread(_receive, connection))
+            except (EOFError, OSError):
+                connection.close()
+                continue
 
+            if isinstance(request, _Terminate):
+                await asyncio.gather(*calls)
+                connection.close()
+                return
+
+            call = asyncio.create_task(
+                _handle_call(connection, request, instance, methods, method_lock)
+            )
+            calls.add(call)
+            call.add_done_callback(calls.discard)
+
+
+class _MethodLock:
+    """A writer-preferring lock for async and synchronous actor methods."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._active_async = 0
+        self._sync_active = False
+        self._waiting_sync = 0
+
+    async def acquire_async(self) -> None:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._sync_active and self._waiting_sync == 0
+            )
+            self._active_async += 1
+
+    async def release_async(self) -> None:
+        async with self._condition:
+            self._active_async -= 1
+            if self._active_async == 0:
+                self._condition.notify_all()
+
+    async def acquire_sync(self) -> None:
+        async with self._condition:
+            self._waiting_sync += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: not self._sync_active and self._active_async == 0
+                )
+                self._sync_active = True
+            finally:
+                self._waiting_sync -= 1
+
+    async def release_sync(self) -> None:
+        async with self._condition:
+            self._sync_active = False
+            self._condition.notify_all()
+
+
+async def _handle_call(
+    connection: Connection,
+    request: object,
+    instance: object,
+    methods: _ExposedMethods,
+    method_lock: _MethodLock,
+) -> None:
+    with connection:
+        try:
+            if not isinstance(request, _Call) or request.method not in methods.all:
+                raise ActorError("Received a call to an unexposed actor method")
+            method = cast(Callable[..., object], getattr(instance, request.method))
+            if request.method in methods.asynchronous:
+                await method_lock.acquire_async()
                 try:
-                    _send(connection, response)
-                except BaseException as exception:
-                    fallback = ActorError(
-                        f"Could not serialize actor response: {exception}"
+                    async_method = cast(Callable[..., Awaitable[object]], method)
+                    value = await async_method(*request.args, **request.kwargs)
+                finally:
+                    await method_lock.release_async()
+            else:
+                await method_lock.acquire_sync()
+                try:
+                    value = await asyncio.to_thread(
+                        method, *request.args, **request.kwargs
                     )
-                    _send(connection, _Failure(fallback))
+                finally:
+                    await method_lock.release_sync()
+            response: _Response = _Result(value)
+        except BaseException as exception:
+            exception.add_note(
+                "Remote actor traceback:\n"
+                + "".join(traceback.format_exception(exception))
+            )
+            response = _Failure(exception)
+
+        try:
+            response_data = _serialize(response)
+        except BaseException as exception:
+            fallback = ActorError(f"Could not serialize actor response: {exception}")
+            response_data = _serialize(_Failure(fallback))
+
+        try:
+            await asyncio.to_thread(connection.send_bytes, response_data)
+        except (EOFError, OSError):
+            pass
 
 
 async def terminate(actor_ref: ActorRef[object]) -> None:
@@ -296,8 +385,8 @@ def _terminate_ref(actor_ref: ActorRef[object]) -> None:
 def actor(cls: type[T]) -> ActorClass[T]:
     """Run instances of ``cls`` as actors in spawned subprocesses.
 
-    Only public async instance methods are exposed. Construction starts the
-    subprocess immediately and returns once ``cls.__init__`` has completed.
+    Public instance methods are exposed. Construction starts the subprocess
+    immediately and returns once ``cls.__init__`` has completed.
     """
 
     methods = _exposed_methods(cls)
@@ -338,7 +427,7 @@ def actor(cls: type[T]) -> ActorClass[T]:
 
         address = cast(Address, startup_response.value)
         _register_owned_process(address, process)
-        return ActorRef(address, methods)
+        return ActorRef(address, methods.all)
 
     create_actor.__name__ = cls.__name__
     create_actor.__qualname__ = cls.__qualname__

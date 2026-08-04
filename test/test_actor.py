@@ -4,6 +4,7 @@ import inspect
 import os
 import pickle
 import threading
+import time
 from typing import Any, cast
 
 import pytest
@@ -60,13 +61,43 @@ class Forwarder:
 @actor
 class SlowCounter:
     def __init__(self) -> None:
-        self.value = 0
+        self.active = 0
+        self.both_started = asyncio.Event()
 
-    async def increment(self) -> int:
-        old_value = self.value
-        await asyncio.sleep(0.02)
-        self.value = old_value + 1
-        return self.value
+    async def rendezvous(self) -> int:
+        self.active += 1
+        if self.active == 2:
+            self.both_started.set()
+        await asyncio.wait_for(self.both_started.wait(), timeout=1)
+        return self.active
+
+
+@actor
+class MixedMethods:
+    def __init__(self) -> None:
+        self.async_active = 0
+        self.sync_active = False
+        self.overlapped = False
+
+    async def async_work(self, delay: float) -> bool:
+        if self.sync_active:
+            self.overlapped = True
+        self.async_active += 1
+        await asyncio.sleep(delay)
+        if self.sync_active:
+            self.overlapped = True
+        self.async_active -= 1
+        return self.overlapped
+
+    def sync_work(self, delay: float) -> bool:
+        if self.sync_active or self.async_active != 0:
+            self.overlapped = True
+        self.sync_active = True
+        time.sleep(delay)
+        if self.async_active != 0:
+            self.overlapped = True
+        self.sync_active = False
+        return self.overlapped
 
 
 @actor
@@ -104,17 +135,17 @@ async def test_construction_and_async_method_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_public_async_methods_are_exposed() -> None:
+async def test_only_public_instance_methods_are_exposed() -> None:
     counter = Counter()
     try:
+        assert inspect.iscoroutinefunction(counter.synchronous)
+        assert await counter.synchronous() == "sync"
         with pytest.raises(AttributeError):
             getattr(counter, "value")
         with pytest.raises(AttributeError):
             getattr(counter, "doubled")
         with pytest.raises(AttributeError):
             getattr(counter, "_private")
-        with pytest.raises(AttributeError):
-            getattr(counter, "synchronous")
         with pytest.raises(AttributeError):
             getattr(counter, "missing")
         with pytest.raises(AttributeError):
@@ -126,13 +157,45 @@ async def test_only_public_async_methods_are_exposed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_actor_calls_are_serialized() -> None:
+async def test_async_actor_calls_run_concurrently() -> None:
     counter = SlowCounter()
     try:
-        results = await asyncio.gather(*(counter.increment() for _ in range(8)))
-        assert sorted(results) == list(range(1, 9))
+        results = await asyncio.gather(counter.rendezvous(), counter.rendezvous())
+        assert results == [2, 2]
     finally:
         _collect_actor(counter)
+
+
+@pytest.mark.asyncio
+async def test_sync_actor_calls_are_exclusive_with_all_methods() -> None:
+    mixed = MixedMethods()
+    try:
+        results = await asyncio.gather(
+            mixed.async_work(0.05),
+            mixed.sync_work(0.05),
+            mixed.async_work(0.05),
+            mixed.sync_work(0.05),
+        )
+        assert results == [False, False, False, False]
+    finally:
+        _collect_actor(mixed)
+
+
+@pytest.mark.asyncio
+async def test_sync_actor_call_does_not_block_callers_event_loop() -> None:
+    mixed = MixedMethods()
+    heartbeat_ran = False
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ran
+        await asyncio.sleep(0.01)
+        heartbeat_ran = True
+
+    try:
+        await asyncio.gather(mixed.sync_work(0.05), heartbeat())
+        assert heartbeat_ran
+    finally:
+        _collect_actor(mixed)
 
 
 @pytest.mark.asyncio
