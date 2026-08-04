@@ -40,12 +40,13 @@ if __name__ == "__main__":
 
 An actor exposes only methods that:
 
-- are instance methods declared with `async def`; and
+- are instance methods declared with `def` or `async def`; and
 - do not begin with an underscore.
 
-Fields, properties, synchronous methods, and private methods are not available
-through the actor reference. Static methods and class methods are also not
-exposed. Looking one up raises `AttributeError`.
+Fields, properties, private methods, static methods, and class methods are not
+available through the actor reference. Looking one up raises `AttributeError`.
+Calls through an `ActorRef` are always asynchronous, including calls backed by
+a synchronous method, so every exposed method is called with `await`.
 
 ```python
 @actor
@@ -56,22 +57,24 @@ class Example:
         return "yes"
 
     def synchronous(self) -> str:
-        return "not exposed"
+        return "also exposed"
 
     async def _private(self) -> str:
         return "not exposed"
 ```
 
-Calls to one actor execute serially in its subprocess. Calling methods on
-different actors can run concurrently:
+Calls to async methods on one actor can run concurrently. A synchronous method
+executes exclusively: it waits for running async methods to finish and prevents
+other sync or async methods from running until it returns. The actor continues
+to receive calls while a synchronous method holds the lock, so submitting an
+async call does not block the caller's event loop.
 
 ```python
-first = Counter()
-second = Counter()
+counter = Counter()
 
 first_result, second_result = await asyncio.gather(
-    first.add(2),
-    second.add(3),
+    counter.add(2),
+    counter.add(3),
 )
 ```
 
@@ -136,9 +139,9 @@ An actor remains alive until either:
 - `await terminate(actor_ref)` explicitly terminates it; or
 - the process that created it exits.
 
-Termination is graceful: the actor finishes its current method call, closes its
-listener, and terminates actors that it created. Ownership is recursive, so
-terminating the `Spawner` above also terminates its counter. `terminate` is
+Termination is graceful: the actor finishes its accepted method calls, closes
+its listener, and terminates actors that it created. Ownership is recursive,
+so terminating the `Spawner` above also terminates its counter. `terminate` is
 idempotent and accepts any reference to the actor.
 
 ```python
