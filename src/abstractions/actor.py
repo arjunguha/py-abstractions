@@ -1,8 +1,8 @@
 """Small, subprocess-backed actors.
 
 Decorating a class with :func:`actor` replaces the class with a callable that
-starts an instance in a spawned subprocess. Public async methods are available
-on the returned :class:`ActorRef`.
+starts an instance in a spawned subprocess. Public instance methods are
+available on the returned :class:`ActorRef`.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing_extensions import override
 T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
 AsyncMethod = Callable[..., Awaitable[Any]]
+SyncMethod = Callable[..., Any]
 Address = tuple[str, int]
 _owned_processes: dict[Address, SpawnProcess] = {}
 
@@ -74,6 +75,42 @@ _Request = _Call | _Terminate
 _Response = _Result | _Failure
 
 
+class _ActorGate:
+    """Reader-writer gate for actor method execution.
+
+    Async methods take shared access and may run concurrently. Sync methods take
+    exclusive access and exclude both sync and async methods while they run.
+    """
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._shared = 0
+        self._exclusive = False
+
+    async def acquire_shared(self) -> None:
+        async with self._condition:
+            while self._exclusive:
+                await self._condition.wait()
+            self._shared += 1
+
+    async def release_shared(self) -> None:
+        async with self._condition:
+            self._shared -= 1
+            if self._shared == 0:
+                self._condition.notify_all()
+
+    async def acquire_exclusive(self) -> None:
+        async with self._condition:
+            while self._exclusive or self._shared > 0:
+                await self._condition.wait()
+            self._exclusive = True
+
+    async def release_exclusive(self) -> None:
+        async with self._condition:
+            self._exclusive = False
+            self._condition.notify_all()
+
+
 def _serialize(value: object) -> bytes:
     return cloudpickle.dumps(value)
 
@@ -90,17 +127,19 @@ def _receive(connection: Connection) -> object:
     return _deserialize(connection.recv_bytes())
 
 
-def _exposed_methods(cls: type[object]) -> frozenset[str]:
-    exposed: set[str] = set()
+def _exposed_methods(cls: type[object]) -> tuple[frozenset[str], frozenset[str]]:
+    async_methods: set[str] = set()
+    sync_methods: set[str] = set()
     for name, descriptor in inspect.getmembers_static(cls):
         if name.startswith("_"):
             continue
         if isinstance(descriptor, (staticmethod, classmethod)):
             continue
-        if not inspect.iscoroutinefunction(descriptor):
-            continue
-        exposed.add(name)
-    return frozenset(exposed)
+        if inspect.iscoroutinefunction(descriptor):
+            async_methods.add(name)
+        elif inspect.isfunction(descriptor):
+            sync_methods.add(name)
+    return frozenset(async_methods), frozenset(sync_methods)
 
 
 def _terminate_at_address(address: Address) -> None:
@@ -139,37 +178,50 @@ def _register_owned_process(address: Address, process: SpawnProcess) -> None:
 class ActorRef(Generic[T_co]):
     """A pickleable reference to an object living in another process.
 
-    Actor methods are resolved dynamically. Every resolved method is an async
-    callable and every call executes on the actor's single subprocess.
+    Actor methods are resolved dynamically. Async methods remain async callables
+    and may run concurrently in the actor process. Sync methods remain
+    synchronous callables and run exclusively.
     """
 
     def __init__(
         self,
         address: Address,
-        methods: frozenset[str],
+        async_methods: frozenset[str],
+        sync_methods: frozenset[str],
     ) -> None:
         self._address = address
-        self._methods = methods
+        self._async_methods = async_methods
+        self._sync_methods = sync_methods
 
-    def __getattr__(self, name: str) -> AsyncMethod:
-        if name not in self._methods:
-            raise AttributeError(
-                f"{type(self).__name__!s} has no exposed method {name!r}"
-            )
+    def __getattr__(self, name: str) -> AsyncMethod | SyncMethod:
+        if name in self._async_methods:
 
-        async def invoke(*args: object, **kwargs: object) -> Any:
-            return await asyncio.to_thread(self._call, name, args, kwargs)
+            async def async_invoke(*args: object, **kwargs: object) -> Any:
+                return await asyncio.to_thread(self._call, name, args, kwargs)
 
-        return invoke
+            return async_invoke
+
+        if name in self._sync_methods:
+
+            def sync_invoke(*args: object, **kwargs: object) -> Any:
+                return self._call(name, args, kwargs)
+
+            return sync_invoke
+
+        raise AttributeError(
+            f"{type(self).__name__!s} has no exposed method {name!r}"
+        )
 
     @override
-    def __getstate__(self) -> tuple[Address, frozenset[str]]:
-        return self._address, self._methods
+    def __getstate__(
+        self,
+    ) -> tuple[Address, frozenset[str], frozenset[str]]:
+        return self._address, self._async_methods, self._sync_methods
 
     def __setstate__(
-        self, state: tuple[Address, frozenset[str]]
+        self, state: tuple[Address, frozenset[str], frozenset[str]]
     ) -> None:
-        self._address, self._methods = state
+        self._address, self._async_methods, self._sync_methods = state
 
     @override
     def __repr__(self) -> str:
@@ -207,7 +259,8 @@ def _actor_process(
     class_data: bytes,
     args_data: bytes,
     kwargs_data: bytes,
-    methods: frozenset[str],
+    async_methods: frozenset[str],
+    sync_methods: frozenset[str],
     startup: Connection,
 ) -> None:
     listener: Listener | None = None
@@ -231,48 +284,95 @@ def _actor_process(
         startup.close()
 
     assert listener is not None
-    asyncio.run(_serve_actor(listener, instance, methods))
+    asyncio.run(_serve_actor(listener, instance, async_methods, sync_methods))
 
 
 async def _serve_actor(
     listener: Listener,
     instance: object,
-    methods: frozenset[str],
+    async_methods: frozenset[str],
+    sync_methods: frozenset[str],
 ) -> None:
-    with listener:
-        while True:
+    methods = async_methods | sync_methods
+    gate = _ActorGate()
+    shutting_down = asyncio.Event()
+    tasks: set[asyncio.Task[None]] = set()
+
+    async def handle_connection(connection: Connection) -> None:
+        response: _Response | None = None
+        try:
+            request = cast(_Request, await asyncio.to_thread(_receive, connection))
+            if isinstance(request, _Terminate):
+                shutting_down.set()
+                listener.close()
+                return
+            if not isinstance(request, _Call) or request.method not in methods:
+                raise ActorError("Received a call to an unexposed actor method")
+
+            method = getattr(instance, request.method)
+            if request.method in async_methods:
+                await gate.acquire_shared()
+                try:
+                    value = await cast(Callable[..., Awaitable[object]], method)(
+                        *request.args, **request.kwargs
+                    )
+                finally:
+                    await gate.release_shared()
+            else:
+                await gate.acquire_exclusive()
+                try:
+                    value = await asyncio.to_thread(
+                        cast(Callable[..., object], method),
+                        *request.args,
+                        **request.kwargs,
+                    )
+                finally:
+                    await gate.release_exclusive()
+            response = _Result(value)
+        except BaseException as exception:
+            exception.add_note(
+                "Remote actor traceback:\n"
+                + "".join(traceback.format_exception(exception))
+            )
+            response = _Failure(exception)
+        finally:
+            if response is not None:
+                try:
+                    await asyncio.to_thread(_send, connection, response)
+                except BaseException as exception:
+                    fallback = ActorError(
+                        f"Could not serialize actor response: {exception}"
+                    )
+                    try:
+                        await asyncio.to_thread(_send, connection, _Failure(fallback))
+                    except BaseException:
+                        pass
+            await asyncio.to_thread(connection.close)
+
+    async def accept_loop() -> None:
+        while not shutting_down.is_set():
             try:
                 connection = await asyncio.to_thread(listener.accept)
             except (OSError, EOFError):
                 return
 
-            with connection:
-                try:
-                    request = cast(_Request, _receive(connection))
-                    if isinstance(request, _Terminate):
-                        return
-                    if not isinstance(request, _Call) or request.method not in methods:
-                        raise ActorError("Received a call to an unexposed actor method")
-                    method = cast(
-                        Callable[..., Awaitable[object]],
-                        getattr(instance, request.method),
-                    )
-                    value = await method(*request.args, **request.kwargs)
-                    response: _Response = _Result(value)
-                except BaseException as exception:
-                    exception.add_note(
-                        "Remote actor traceback:\n"
-                        + "".join(traceback.format_exception(exception))
-                    )
-                    response = _Failure(exception)
+            if shutting_down.is_set():
+                await asyncio.to_thread(connection.close)
+                return
 
-                try:
-                    _send(connection, response)
-                except BaseException as exception:
-                    fallback = ActorError(
-                        f"Could not serialize actor response: {exception}"
-                    )
-                    _send(connection, _Failure(fallback))
+            task = asyncio.create_task(handle_connection(connection))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    accept_task = asyncio.create_task(accept_loop())
+    await shutting_down.wait()
+    try:
+        listener.close()
+    except OSError:
+        pass
+    await accept_task
+    if tasks:
+        await asyncio.wait(tasks)
 
 
 async def terminate(actor_ref: ActorRef[object]) -> None:
@@ -296,11 +396,12 @@ def _terminate_ref(actor_ref: ActorRef[object]) -> None:
 def actor(cls: type[T]) -> ActorClass[T]:
     """Run instances of ``cls`` as actors in spawned subprocesses.
 
-    Only public async instance methods are exposed. Construction starts the
-    subprocess immediately and returns once ``cls.__init__`` has completed.
+    Public instance methods are exposed. Async methods may run concurrently;
+    sync methods run exclusively. Construction starts the subprocess immediately
+    and returns once ``cls.__init__`` has completed.
     """
 
-    methods = _exposed_methods(cls)
+    async_methods, sync_methods = _exposed_methods(cls)
     class_data = _serialize(cls)
 
     def create_actor(*args: object, **kwargs: object) -> ActorRef[T]:
@@ -312,7 +413,8 @@ def actor(cls: type[T]) -> ActorClass[T]:
                 class_data,
                 _serialize(args),
                 _serialize(kwargs),
-                methods,
+                async_methods,
+                sync_methods,
                 child_startup,
             ),
             name=f"{cls.__name__}Actor",
@@ -338,7 +440,7 @@ def actor(cls: type[T]) -> ActorClass[T]:
 
         address = cast(Address, startup_response.value)
         _register_owned_process(address, process)
-        return ActorRef(address, methods)
+        return ActorRef(address, async_methods, sync_methods)
 
     create_actor.__name__ = cls.__name__
     create_actor.__qualname__ = cls.__qualname__

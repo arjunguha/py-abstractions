@@ -20,6 +20,9 @@ class Counter:
         self.value += amount
         return self.value
 
+    def value_now(self) -> int:
+        return self.value
+
     async def process_id(self) -> int:
         return os.getpid()
 
@@ -28,6 +31,7 @@ async def main() -> None:
     counter = Counter(10)
 
     assert await counter.add() == 11
+    assert counter.value_now() == 11
     assert await counter.add(4) == 15
     assert await counter.process_id() != os.getpid()
 
@@ -40,39 +44,68 @@ if __name__ == "__main__":
 
 An actor exposes only methods that:
 
-- are instance methods declared with `async def`; and
+- are public instance methods (declared with `def` or `async def`); and
 - do not begin with an underscore.
 
-Fields, properties, synchronous methods, and private methods are not available
-through the actor reference. Static methods and class methods are also not
-exposed. Looking one up raises `AttributeError`.
+Fields, properties, and private methods are not available through the actor
+reference. Static methods and class methods are also not exposed. Looking one up
+raises `AttributeError`.
+
+Async methods on the actor remain async on the reference. Sync methods remain
+sync and block the caller until the remote call completes.
 
 ```python
 @actor
 class Example:
     field = "not exposed"
 
-    async def exposed(self) -> str:
+    async def exposed_async(self) -> str:
         return "yes"
 
-    def synchronous(self) -> str:
-        return "not exposed"
+    def exposed_sync(self) -> str:
+        return "yes"
 
     async def _private(self) -> str:
         return "not exposed"
 ```
 
-Calls to one actor execute serially in its subprocess. Calling methods on
-different actors can run concurrently:
+## Concurrency
+
+Async methods on one actor may run concurrently with each other. The actor
+process accepts calls continuously and runs each async method in its own task,
+so overlapping `await`s on the same actor can execute at the same time:
 
 ```python
 first = Counter()
 second = Counter()
 
-first_result, second_result = await asyncio.gather(
-    first.add(2),
-    second.add(3),
-)
+# Concurrent calls to different actors, and concurrent async calls to one actor,
+# are both allowed:
+await asyncio.gather(first.add(2), first.add(3), second.add(4))
+```
+
+Because async methods can overlap, they must tolerate concurrent access to the
+actor's state (or leave mutation to sync methods).
+
+Sync methods take an exclusive lock: while a sync method runs, no other sync or
+async method runs on that actor. In-flight async methods finish before the sync
+method starts, and new async methods wait for the lock without blocking the
+actor from accepting further calls. Submitting an async call while the actor is
+locked therefore does not block the caller from making progress on other work;
+only awaiting that call waits for the sync method to finish.
+
+```python
+@actor
+class Mixed:
+    def __init__(self) -> None:
+        self.value = 0
+
+    def replace(self, value: int) -> int:
+        self.value = value
+        return self.value
+
+    async def read(self) -> int:
+        return self.value
 ```
 
 ## Passing actor references
@@ -136,7 +169,7 @@ An actor remains alive until either:
 - `await terminate(actor_ref)` explicitly terminates it; or
 - the process that created it exits.
 
-Termination is graceful: the actor finishes its current method call, closes its
+Termination is graceful: the actor finishes in-flight method calls, closes its
 listener, and terminates actors that it created. Ownership is recursive, so
 terminating the `Spawner` above also terminates its counter. `terminate` is
 idempotent and accepts any reference to the actor.
@@ -159,8 +192,9 @@ other processes may still hold transferred copies of that reference.
 ## Errors and serialization
 
 Constructor errors are raised immediately when the decorated class is called.
-Exceptions from actor methods are raised when the method call is awaited and
-include the remote traceback as an exception note.
+Exceptions from actor methods are raised when the method call returns (for sync
+methods) or when it is awaited (for async methods) and include the remote
+traceback as an exception note.
 
 A method call to an explicitly terminated, crashed, or otherwise unreachable
 actor raises `ActorDiedError`, which is a subclass of `ActorError`.

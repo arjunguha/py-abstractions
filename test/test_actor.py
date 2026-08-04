@@ -1,9 +1,11 @@
 import asyncio
 import gc
 import inspect
+import multiprocessing
 import os
 import pickle
 import threading
+import time
 from typing import Any, cast
 
 import pytest
@@ -20,6 +22,13 @@ class Counter:
 
     async def add(self, amount: int = 1) -> int:
         self.value += amount
+        return self.value
+
+    def value_now(self) -> int:
+        return self.value
+
+    def replace(self, value: int) -> int:
+        self.value = value
         return self.value
 
     async def process_id(self) -> int:
@@ -58,15 +67,47 @@ class Forwarder:
 
 
 @actor
-class SlowCounter:
+class ConcurrentProbe:
     def __init__(self) -> None:
-        self.value = 0
+        self.current = 0
+        self.max_current = 0
 
-    async def increment(self) -> int:
-        old_value = self.value
-        await asyncio.sleep(0.02)
-        self.value = old_value + 1
-        return self.value
+    async def work(self) -> int:
+        self.current += 1
+        self.max_current = max(self.max_current, self.current)
+        await asyncio.sleep(0.05)
+        self.current -= 1
+        return self.max_current
+
+    async def max_seen(self) -> int:
+        return self.max_current
+
+
+@actor
+class MixedProbe:
+    def __init__(self) -> None:
+        self.in_sync = False
+        self.in_async = 0
+        self.overlap = False
+
+    def sync_work(self) -> bool:
+        if self.in_async:
+            self.overlap = True
+        self.in_sync = True
+        time.sleep(0.05)
+        self.in_sync = False
+        return self.overlap
+
+    async def async_work(self) -> bool:
+        if self.in_sync:
+            self.overlap = True
+        self.in_async += 1
+        await asyncio.sleep(0.05)
+        self.in_async -= 1
+        return self.overlap
+
+    def saw_overlap(self) -> bool:
+        return self.overlap
 
 
 @actor
@@ -104,7 +145,21 @@ async def test_construction_and_async_method_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_public_async_methods_are_exposed() -> None:
+async def test_sync_methods_are_exposed_and_block() -> None:
+    counter = Counter(10)
+    try:
+        assert not inspect.iscoroutinefunction(counter.synchronous)
+        assert counter.synchronous() == "sync"
+        assert counter.value_now() == 10
+        assert counter.replace(42) == 42
+        assert await counter.add() == 43
+        assert counter.value_now() == 43
+    finally:
+        _collect_actor(counter)
+
+
+@pytest.mark.asyncio
+async def test_only_public_instance_methods_are_exposed() -> None:
     counter = Counter()
     try:
         with pytest.raises(AttributeError):
@@ -113,8 +168,6 @@ async def test_only_public_async_methods_are_exposed() -> None:
             getattr(counter, "doubled")
         with pytest.raises(AttributeError):
             getattr(counter, "_private")
-        with pytest.raises(AttributeError):
-            getattr(counter, "synchronous")
         with pytest.raises(AttributeError):
             getattr(counter, "missing")
         with pytest.raises(AttributeError):
@@ -126,13 +179,76 @@ async def test_only_public_async_methods_are_exposed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_actor_calls_are_serialized() -> None:
-    counter = SlowCounter()
+async def test_async_methods_run_concurrently() -> None:
+    probe = ConcurrentProbe()
     try:
-        results = await asyncio.gather(*(counter.increment() for _ in range(8)))
-        assert sorted(results) == list(range(1, 9))
+        results = await asyncio.gather(*(probe.work() for _ in range(8)))
+        assert max(results) > 1
+        assert await probe.max_seen() > 1
     finally:
-        _collect_actor(counter)
+        _collect_actor(probe)
+
+
+@pytest.mark.asyncio
+async def test_sync_methods_exclude_other_operations() -> None:
+    probe = MixedProbe()
+    try:
+        results = await asyncio.gather(
+            asyncio.to_thread(probe.sync_work),
+            probe.async_work(),
+            probe.async_work(),
+            asyncio.to_thread(probe.sync_work),
+            probe.async_work(),
+        )
+        assert results == [False, False, False, False, False]
+        assert probe.saw_overlap() is False
+    finally:
+        _collect_actor(probe)
+
+
+@pytest.mark.asyncio
+async def test_async_call_does_not_block_caller_while_sync_holds_lock() -> None:
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+
+    @actor
+    class HoldProbe:
+        def __init__(self, entered_event: Any, release_event: Any) -> None:
+            self._entered = entered_event
+            self._release = release_event
+            self.ran_during_hold = False
+
+        def hold(self) -> None:
+            self._entered.set()
+            self._release.wait(timeout=5)
+
+        async def marker(self) -> str:
+            if not self._release.is_set():
+                self.ran_during_hold = True
+            return "done"
+
+        def saw_run_during_hold(self) -> bool:
+            return self.ran_during_hold
+
+    probe = HoldProbe(entered, release)
+    try:
+        hold_task = asyncio.create_task(asyncio.to_thread(probe.hold))
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        marker_task = asyncio.create_task(probe.marker())
+        # Sending the async call must not block this event loop: we can still
+        # release the sync method while the async call is waiting for the lock.
+        await asyncio.sleep(0.05)
+        assert not marker_task.done()
+        release.set()
+
+        await hold_task
+        assert await marker_task == "done"
+        assert probe.saw_run_during_hold() is False
+    finally:
+        release.set()
+        _collect_actor(probe)
 
 
 @pytest.mark.asyncio
@@ -154,6 +270,7 @@ async def test_actor_reference_is_pickleable() -> None:
     try:
         assert await copied.add(3) == 5
         assert await counter.add() == 6
+        assert copied.value_now() == 6
     finally:
         del copied
         _collect_actor(counter)
@@ -190,9 +307,13 @@ async def test_local_actor_classes_work_with_spawn() -> None:
         async def echo(self, value: str) -> str:
             return value
 
+        def tag(self) -> str:
+            return "local"
+
     local = Local()
     try:
         assert await local.echo("hello") == "hello"
+        assert local.tag() == "local"
     finally:
         _collect_actor(local)
 
