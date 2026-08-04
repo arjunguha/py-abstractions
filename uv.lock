@@ -19,7 +19,6 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ty" },
-    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -36,7 +35,6 @@ dev = [
     { name = "pytest", specifier = ">=8.4.1" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "ty", specifier = ">=0.0.42" },
-    { name = "typing-extensions", specifier = ">=4.15.0" },
 ]
 
 [[package]]

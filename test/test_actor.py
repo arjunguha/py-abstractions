@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 
-from abstractions.actor import ActorError, ActorRef, actor
+from abstractions import ActorError, ActorRef, actor
 
 
 @actor
