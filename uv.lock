@@ -8,6 +8,7 @@ version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "cloudpickle" },
+    { name = "typing-extensions" },
 ]
 
 [package.dev-dependencies]
@@ -22,7 +23,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "cloudpickle", specifier = ">=3.1.2" }]
+requires-dist = [
+    { name = "cloudpickle", specifier = ">=3.1.2" },
+    { name = "typing-extensions", specifier = ">=4.15.0" },
+]
 
 [package.metadata.requires-dev]
 dev = [

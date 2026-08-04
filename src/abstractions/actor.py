@@ -19,6 +19,7 @@ from multiprocessing.context import SpawnProcess
 from typing import Any, Generic, Protocol, TypeVar, cast
 
 import cloudpickle
+from typing_extensions import override
 
 
 T_co = TypeVar("T_co", covariant=True)
@@ -112,12 +113,10 @@ class ActorRef(Generic[T_co]):
     def __init__(
         self,
         address: Address,
-        authkey: bytes,
         methods: frozenset[str],
         process: SpawnProcess | None = None,
     ) -> None:
         self._address = address
-        self._authkey = authkey
         self._methods = methods
         self._finalizer: weakref.finalize | None = None
         if process is not None:
@@ -134,15 +133,17 @@ class ActorRef(Generic[T_co]):
 
         return invoke
 
-    def __getstate__(self) -> tuple[Address, bytes, frozenset[str]]:
-        return self._address, self._authkey, self._methods
+    @override
+    def __getstate__(self) -> tuple[Address, frozenset[str]]:
+        return self._address, self._methods
 
     def __setstate__(
-        self, state: tuple[Address, bytes, frozenset[str]]
+        self, state: tuple[Address, frozenset[str]]
     ) -> None:
-        self._address, self._authkey, self._methods = state
+        self._address, self._methods = state
         self._finalizer = None
 
+    @override
     def __repr__(self) -> str:
         host, port = self._address
         return f"ActorRef(address={host}:{port})"
@@ -154,7 +155,7 @@ class ActorRef(Generic[T_co]):
         kwargs: Mapping[str, object],
     ) -> Any:
         try:
-            with Client(self._address, authkey=self._authkey) as connection:
+            with Client(self._address) as connection:
                 _send(connection, _Call(method, args, kwargs))
                 response = cast(_Response, _receive(connection))
         except (EOFError, OSError) as exception:
@@ -174,7 +175,6 @@ def _actor_process(
     args_data: bytes,
     kwargs_data: bytes,
     methods: frozenset[str],
-    authkey: bytes,
     startup: Connection,
 ) -> None:
     listener: Listener | None = None
@@ -183,7 +183,11 @@ def _actor_process(
         args = cast(tuple[object, ...], _deserialize(args_data))
         kwargs = cast(dict[str, object], _deserialize(kwargs_data))
         instance = cls(*args, **kwargs)
-        listener = Listener(("127.0.0.1", 0), family="AF_INET", authkey=authkey)
+        listener = Listener(
+            ("127.0.0.1", 0),
+            family="AF_INET",
+            backlog=128,
+        )
         address = cast(Address, listener.address)
         _send(startup, _Result(address))
     except BaseException as exception:
@@ -214,7 +218,10 @@ async def _serve_actor(
                     request = cast(_Call, _receive(connection))
                     if not isinstance(request, _Call) or request.method not in methods:
                         raise ActorError("Received a call to an unexposed actor method")
-                    method = cast(Callable[..., Awaitable[object]], getattr(instance, request.method))
+                    method = cast(
+                        Callable[..., Awaitable[object]],
+                        getattr(instance, request.method),
+                    )
                     value = await method(*request.args, **request.kwargs)
                     response: _Response = _Result(value)
                 except BaseException as exception:
@@ -246,21 +253,16 @@ def actor(cls: type[T]) -> ActorClass[T]:
     def create_actor(*args: object, **kwargs: object) -> ActorRef[T]:
         context = multiprocessing.get_context("spawn")
         parent_startup, child_startup = context.Pipe(duplex=False)
-        authkey = bytes(multiprocessing.current_process().authkey)
-        process = cast(
-            SpawnProcess,
-            context.Process(
+        process = context.Process(
             target=_actor_process,
             args=(
                 class_data,
                 _serialize(args),
                 _serialize(kwargs),
                 methods,
-                authkey,
                 child_startup,
             ),
             name=f"{cls.__name__}Actor",
-            ),
         )
         process.start()
         child_startup.close()
@@ -280,7 +282,7 @@ def actor(cls: type[T]) -> ActorClass[T]:
             _terminate(process)
             raise ActorError("Actor returned an invalid startup response")
 
-        return ActorRef(cast(Address, startup_response.value), authkey, methods, process)
+        return ActorRef(cast(Address, startup_response.value), methods, process)
 
     create_actor.__name__ = cls.__name__
     create_actor.__qualname__ = cls.__qualname__
