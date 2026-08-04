@@ -203,6 +203,7 @@ async def test_unserializable_arguments_raise_actor_error() -> None:
     try:
         with pytest.raises(ActorError, match="Could not serialize actor request"):
             await counter.echo(threading.Lock())
+        assert await counter.add() == 1
     finally:
         _collect_actor(counter)
 

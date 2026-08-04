@@ -7,11 +7,11 @@ on the returned :class:`ActorRef`.
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import inspect
 import multiprocessing
 import traceback
-import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from multiprocessing.connection import Client, Connection, Listener
@@ -26,6 +26,7 @@ T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
 AsyncMethod = Callable[..., Awaitable[Any]]
 Address = tuple[str, int]
+_owned_processes: set[SpawnProcess] = set()
 
 
 class ActorClass(Protocol[T_co]):
@@ -97,10 +98,16 @@ def _exposed_methods(cls: type[object]) -> frozenset[str]:
     return frozenset(exposed)
 
 
-def _terminate(process: SpawnProcess) -> None:
-    if process.is_alive():
-        process.terminate()
-    process.join()
+def _terminate_owned_processes() -> None:
+    for process in _owned_processes:
+        if process.is_alive():
+            process.terminate()
+    for process in _owned_processes:
+        process.join()
+    _owned_processes.clear()
+
+
+atexit.register(_terminate_owned_processes)
 
 
 class ActorRef(Generic[T_co]):
@@ -114,13 +121,9 @@ class ActorRef(Generic[T_co]):
         self,
         address: Address,
         methods: frozenset[str],
-        process: SpawnProcess | None = None,
     ) -> None:
         self._address = address
         self._methods = methods
-        self._finalizer: weakref.finalize | None = None
-        if process is not None:
-            self._finalizer = weakref.finalize(self, _terminate, process)
 
     def __getattr__(self, name: str) -> AsyncMethod:
         if name not in self._methods:
@@ -141,7 +144,6 @@ class ActorRef(Generic[T_co]):
         self, state: tuple[Address, frozenset[str]]
     ) -> None:
         self._address, self._methods = state
-        self._finalizer = None
 
     @override
     def __repr__(self) -> str:
@@ -155,8 +157,13 @@ class ActorRef(Generic[T_co]):
         kwargs: Mapping[str, object],
     ) -> Any:
         try:
+            request_data = _serialize(_Call(method, args, kwargs))
+        except Exception as exception:
+            raise ActorError("Could not serialize actor request") from exception
+
+        try:
             with Client(self._address) as connection:
-                _send(connection, _Call(method, args, kwargs))
+                connection.send_bytes(request_data)
                 response = cast(_Response, _receive(connection))
         except (EOFError, OSError) as exception:
             raise ActorError(
@@ -279,10 +286,12 @@ def actor(cls: type[T]) -> ActorClass[T]:
             process.join()
             raise startup_response.exception
         if not isinstance(startup_response, _Result):
-            _terminate(process)
+            process.terminate()
+            process.join()
             raise ActorError("Actor returned an invalid startup response")
 
-        return ActorRef(cast(Address, startup_response.value), methods, process)
+        _owned_processes.add(process)
+        return ActorRef(cast(Address, startup_response.value), methods)
 
     create_actor.__name__ = cls.__name__
     create_actor.__qualname__ = cls.__qualname__
