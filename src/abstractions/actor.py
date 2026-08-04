@@ -95,14 +95,9 @@ def _exposed_methods(cls: type[object]) -> frozenset[str]:
     for name, descriptor in inspect.getmembers_static(cls):
         if name.startswith("_"):
             continue
-
-        function: object
         if isinstance(descriptor, (staticmethod, classmethod)):
-            function = descriptor.__func__
-        else:
-            function = descriptor
-
-        if not inspect.iscoroutinefunction(function):
+            continue
+        if not inspect.iscoroutinefunction(descriptor):
             continue
         exposed.add(name)
     return frozenset(exposed)
@@ -301,7 +296,7 @@ def _terminate_ref(actor_ref: ActorRef[object]) -> None:
 def actor(cls: type[T]) -> ActorClass[T]:
     """Run instances of ``cls`` as actors in spawned subprocesses.
 
-    Only public async methods are exposed. Construction starts the
+    Only public async instance methods are exposed. Construction starts the
     subprocess immediately and returns once ``cls.__init__`` has completed.
     """
 

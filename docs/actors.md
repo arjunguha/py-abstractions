@@ -40,11 +40,12 @@ if __name__ == "__main__":
 
 An actor exposes only methods that:
 
-- are declared with `async def`; and
+- are instance methods declared with `async def`; and
 - do not begin with an underscore.
 
 Fields, properties, synchronous methods, and private methods are not available
-through the actor reference. Looking one up raises `AttributeError`.
+through the actor reference. Static methods and class methods are also not
+exposed. Looking one up raises `AttributeError`.
 
 ```python
 @actor
