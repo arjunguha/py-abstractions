@@ -54,6 +54,7 @@ plugins:
 
 nav:
   - Home: index.md
+  - Actors: actors.md
 
 
 repo_url: https://github.com/arjunguha/abstractions
