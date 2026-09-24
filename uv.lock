@@ -6,10 +6,6 @@ requires-python = ">=3.11"
 name = "abstractions"
 version = "0.7.0"
 source = { editable = "." }
-dependencies = [
-    { name = "cloudpickle" },
-    { name = "typing-extensions" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -19,13 +15,10 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ty" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "cloudpickle", specifier = ">=3.1.2" },
-    { name = "typing-extensions", specifier = ">=4.15.0" },
-]
 
 [package.metadata.requires-dev]
 dev = [
@@ -35,6 +28,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4.1" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "ty", specifier = ">=0.0.42" },
+    { name = "typing-extensions", specifier = ">=4.15.0" },
 ]
 
 [[package]]
@@ -127,15 +121,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/60/6c/8ca2efa64cf75a977a0d7fac081354553ebe483345c734fb6b6515d96bbc/click-8.2.1.tar.gz", hash = "sha256:27c491cc05d968d271d5a1db13e3b5a184636d9d930f148c50b038f0d0646202", size = 286342, upload-time = "2025-05-20T23:19:49.832Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/85/32/10bb5764d90a8eee674e9dc6f4db6a0ab47c8c4d0d83c27f7c39ac415a4d/click-8.2.1-py3-none-any.whl", hash = "sha256:61a3265b914e850b85317d0b3109c7f8cd35a670f963866005d6ef1d5175a12b", size = 102215, upload-time = "2025-05-20T23:19:47.796Z" },
-]
-
-[[package]]
-name = "cloudpickle"
-version = "3.1.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/27/fb/576f067976d320f5f0114a8d9fa1215425441bb35627b1993e5afd8111e5/cloudpickle-3.1.2.tar.gz", hash = "sha256:7fda9eb655c9c230dab534f1983763de5835249750e85fbcef43aaa30a9a2414", size = 22330, upload-time = "2025-11-03T09:25:26.604Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/39/799be3f2f0f38cc727ee3b4f1445fe6d5e4133064ec2e4115069418a5bb6/cloudpickle-3.1.2-py3-none-any.whl", hash = "sha256:9acb47f6afd73f60dc1df93bb801b472f05ff42fa6c84167d25cb206be1fbf4a", size = 22228, upload-time = "2025-11-03T09:25:25.534Z" },
 ]
 
 [[package]]

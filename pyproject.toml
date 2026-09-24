@@ -7,10 +7,7 @@ authors = [
     { name = "Arjun Guha", email = "a.guha@northeastern.edu" }
 ]
 requires-python = ">=3.11"
-dependencies = [
-    "cloudpickle>=3.1.2",
-    "typing-extensions>=4.15.0",
-]
+dependencies = []
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -31,4 +28,5 @@ dev = [
     "pytest>=8.4.1",
     "pytest-asyncio>=1.1.0",
     "ty>=0.0.42",
+    "typing-extensions>=4.15.0",
 ]

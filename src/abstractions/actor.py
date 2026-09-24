@@ -1,32 +1,44 @@
-"""Small, subprocess-backed actors.
+"""Subprocess actors with asynchronous socket I/O and one synchronous worker.
 
-Decorating a class with :func:`actor` replaces the class with a callable that
-starts an instance in a spawned subprocess. Public instance methods are
-available on the returned :class:`ActorRef`.
+Each actor runs an asyncio event loop. Network I/O never occupies a worker
+thread; synchronous methods share one lazily started auxiliary thread.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import importlib
 import multiprocessing
+import pickle
+import queue
+import socket
+import struct
+import threading
 import traceback
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from multiprocessing.connection import Client, Connection, Listener
+from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnProcess
 from multiprocessing.util import Finalize
 from typing import Any, Generic, Protocol, TypeVar, cast
 
-import cloudpickle
-from typing_extensions import override
-
+__all__ = [
+    "ActorClass",
+    "ActorDiedError",
+    "ActorError",
+    "ActorRef",
+    "actor",
+    "terminate",
+]
 
 T_co = TypeVar("T_co", covariant=True)
 T = TypeVar("T")
-AsyncMethod = Callable[..., Awaitable[Any]]
+AsyncMethod = Callable[..., Coroutine[Any, Any, Any]]
 Address = tuple[str, int]
+_FRAME_SIZE = struct.Struct("!Q")
 _owned_processes: dict[Address, SpawnProcess] = {}
+_actor_context: _ActorContext | None = None
 
 
 class ActorClass(Protocol[T_co]):
@@ -70,7 +82,6 @@ class _Terminate:
     pass
 
 
-_Request = _Call | _Terminate
 _Response = _Result | _Failure
 
 
@@ -80,86 +91,90 @@ class _ExposedMethods:
     asynchronous: frozenset[str]
 
 
+@dataclass
+class _ActorContext:
+    reference: ActorRef[object]
+    stopping: bool = False
+    server: _ActorServer | None = None
+
+
+def _as_actor(self: object) -> ActorRef[Any]:
+    """Return the reference for the actor instance receiving this method."""
+    if _actor_context is None:
+        raise ActorError("as_actor() must be called inside an actor")
+    return _actor_context.reference
+
+
 def _serialize(value: object) -> bytes:
-    return cloudpickle.dumps(value)
+    return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _deserialize(data: bytes) -> object:
-    return cloudpickle.loads(data)
-
-
-def _send(connection: Connection, value: object) -> None:
-    connection.send_bytes(_serialize(value))
-
-
-def _receive(connection: Connection) -> object:
-    return _deserialize(connection.recv_bytes())
-
-
-def _exposed_methods(cls: type[object]) -> _ExposedMethods:
-    exposed: set[str] = set()
-    asynchronous: set[str] = set()
-    for name, descriptor in inspect.getmembers_static(cls):
-        if name.startswith("_"):
-            continue
-        if isinstance(descriptor, (staticmethod, classmethod)):
-            continue
-        if not inspect.isfunction(descriptor):
-            continue
-        exposed.add(name)
-        if inspect.iscoroutinefunction(descriptor):
-            asynchronous.add(name)
-    return _ExposedMethods(frozenset(exposed), frozenset(asynchronous))
-
-
-def _terminate_at_address(address: Address) -> None:
     try:
-        with Client(address) as connection:
-            _send(connection, _Terminate())
-            try:
-                connection.recv_bytes()
-            except EOFError:
-                pass
+        return pickle.loads(data)
+    except Exception as exception:
+        raise ActorError("Could not deserialize actor message") from exception
+
+
+def _serialize_response(response: _Response) -> bytes:
+    try:
+        return _serialize(response)
+    except BaseException as exception:
+        return _serialize(_Failure(ActorError(
+            f"Could not serialize actor response: {exception}"
+        )))
+
+
+async def _read_frame(reader: asyncio.StreamReader) -> bytes:
+    header = await reader.readexactly(_FRAME_SIZE.size)
+    size, = _FRAME_SIZE.unpack(header)
+    return await reader.readexactly(size)
+
+
+async def _write_frame(writer: asyncio.StreamWriter, data: bytes) -> None:
+    writer.write(_FRAME_SIZE.pack(len(data)))
+    writer.write(data)
+    await writer.drain()
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await writer.wait_closed()
     except OSError:
         pass
 
 
-def _terminate_owned_processes() -> None:
-    owned_processes = tuple(_owned_processes.items())
-    for address, process in owned_processes:
-        if process.is_alive():
-            _terminate_at_address(address)
-    for _, process in owned_processes:
-        process.join()
-    _owned_processes.clear()
-
-
-_process_finalizer = Finalize(
-    None,
-    _terminate_owned_processes,
-    exitpriority=10,
-)
-
-
-def _register_owned_process(address: Address, process: SpawnProcess) -> None:
-    _owned_processes[address] = process
+async def _exchange(address: Address, request: object) -> object:
+    try:
+        data = _serialize(request)
+    except Exception as exception:
+        raise ActorError("Could not serialize actor request") from exception
+    try:
+        # Actor addresses are numeric loopback addresses, so opening the
+        # connection does not need an executor for DNS resolution.
+        reader, writer = await asyncio.open_connection(*address)
+        try:
+            await _write_frame(writer, data)
+            return _deserialize(await _read_frame(reader))
+        finally:
+            await _close_writer(writer)
+    except (OSError, asyncio.IncompleteReadError) as exception:
+        raise ActorDiedError(
+            f"Actor at {address[0]}:{address[1]} is not running"
+        ) from exception
 
 
 class ActorRef(Generic[T_co]):
-    """A pickleable reference to an object living in another process.
+    """A pickleable reference whose method calls send asynchronous messages."""
 
-    Actor methods are resolved dynamically. Every resolved method is called
-    asynchronously, regardless of whether its implementation is synchronous or
-    asynchronous.
-    """
-
-    def __init__(
-        self,
-        address: Address,
-        methods: frozenset[str],
-    ) -> None:
+    def __init__(self, address: Address, methods: frozenset[str]) -> None:
         self._address = address
         self._methods = methods
+
+    async def terminate(self) -> None:
+        """Shut down this actor; self-termination only requests shutdown."""
+        await terminate(self)
 
     def __getattr__(self, name: str) -> AsyncMethod:
         if name not in self._methods:
@@ -168,118 +183,76 @@ class ActorRef(Generic[T_co]):
             )
 
         async def invoke(*args: object, **kwargs: object) -> Any:
-            return await asyncio.to_thread(self._call, name, args, kwargs)
+            response = await _exchange(self._address, _Call(name, args, kwargs))
+            if isinstance(response, _Failure):
+                raise response.exception
+            if not isinstance(response, _Result):
+                raise ActorError("Actor returned an invalid response")
+            return response.value
 
         return invoke
 
-    @override
-    def __getstate__(self) -> tuple[Address, frozenset[str]]:
+    # Python 3.11 has no typing.override; keep this module standard-library-only.
+    def __getstate__(self) -> tuple[Address, frozenset[str]]:  # ty: ignore[missing-override-decorator]
         return self._address, self._methods
 
-    def __setstate__(
-        self, state: tuple[Address, frozenset[str]]
-    ) -> None:
+    def __setstate__(self, state: tuple[Address, frozenset[str]]) -> None:
         self._address, self._methods = state
 
-    @override
-    def __repr__(self) -> str:
+    def __repr__(self) -> str:  # ty: ignore[missing-override-decorator]
         host, port = self._address
         return f"ActorRef(address={host}:{port})"
 
-    def _call(
-        self,
-        method: str,
-        args: tuple[object, ...],
-        kwargs: Mapping[str, object],
-    ) -> Any:
-        try:
-            request_data = _serialize(_Call(method, args, kwargs))
-        except Exception as exception:
-            raise ActorError("Could not serialize actor request") from exception
 
-        try:
-            with Client(self._address) as connection:
-                connection.send_bytes(request_data)
-                response = cast(_Response, _receive(connection))
-        except (EOFError, OSError) as exception:
-            raise ActorDiedError(
-                f"Actor at {self._address[0]}:{self._address[1]} is not running"
-            ) from exception
+class _SyncWorker:
+    """The actor's only auxiliary thread, used exclusively for sync methods."""
 
-        if isinstance(response, _Failure):
-            raise response.exception
-        if not isinstance(response, _Result):
-            raise ActorError("Actor returned an invalid response")
-        return response.value
+    def __init__(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._jobs: queue.SimpleQueue[
+            tuple[Callable[[], object], asyncio.Future[_Response]] | None
+        ] = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
 
+    async def call(self, method: Callable[[], object]) -> _Response:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="actor-sync")
+            self._thread.start()
+        future: asyncio.Future[_Response] = self._loop.create_future()
+        self._jobs.put((method, future))
+        return await future
 
-def _actor_process(
-    class_data: bytes,
-    args_data: bytes,
-    kwargs_data: bytes,
-    methods: _ExposedMethods,
-    startup: Connection,
-) -> None:
-    listener: Listener | None = None
-    try:
-        cls = cast(type[object], _deserialize(class_data))
-        args = cast(tuple[object, ...], _deserialize(args_data))
-        kwargs = cast(dict[str, object], _deserialize(kwargs_data))
-        instance = cls(*args, **kwargs)
-        listener = Listener(
-            ("127.0.0.1", 0),
-            family="AF_INET",
-            backlog=128,
-        )
-        address = cast(Address, listener.address)
-        _send(startup, _Result(address))
-    except BaseException as exception:
-        exception.add_note("The actor failed during initialization")
-        _send(startup, _Failure(exception))
-        return
-    finally:
-        startup.close()
-
-    assert listener is not None
-    asyncio.run(_serve_actor(listener, instance, methods))
-
-
-async def _serve_actor(
-    listener: Listener,
-    instance: object,
-    methods: _ExposedMethods,
-) -> None:
-    method_lock = _MethodLock()
-    calls: set[asyncio.Task[None]] = set()
-
-    with listener:
-        while True:
+    def _run(self) -> None:
+        while (job := self._jobs.get()) is not None:
+            method, future = job
             try:
-                connection = await asyncio.to_thread(listener.accept)
-            except (OSError, EOFError):
-                await asyncio.gather(*calls)
-                return
+                response: _Response = _Result(method())
+            except BaseException as exception:
+                response = _remote_failure(exception)
+            self._loop.call_soon_threadsafe(self._deliver, future, response)
 
-            try:
-                request = cast(_Request, await asyncio.to_thread(_receive, connection))
-            except (EOFError, OSError):
-                connection.close()
-                continue
+    @staticmethod
+    def _deliver(future: asyncio.Future[_Response], response: _Response) -> None:
+        if not future.done():
+            future.set_result(response)
 
-            if isinstance(request, _Terminate):
-                await asyncio.gather(*calls)
-                connection.close()
-                return
+    async def close(self) -> None:
+        if self._thread is not None:
+            self._jobs.put(None)
+            while self._thread.is_alive():
+                await asyncio.sleep(0.001)
+            self._thread.join()
 
-            call = asyncio.create_task(
-                _handle_call(connection, request, instance, methods, method_lock)
-            )
-            calls.add(call)
-            call.add_done_callback(calls.discard)
+
+def _remote_failure(exception: BaseException) -> _Failure:
+    exception.add_note(
+        "Remote actor traceback:\n" + "".join(traceback.format_exception(exception))
+    )
+    return _Failure(exception)
 
 
 class _MethodLock:
-    """A writer-preferring lock for async and synchronous actor methods."""
+    """Favor waiting synchronous methods over newly arriving async methods."""
 
     def __init__(self) -> None:
         self._condition = asyncio.Condition()
@@ -310,6 +283,8 @@ class _MethodLock:
                 self._sync_active = True
             finally:
                 self._waiting_sync -= 1
+                if self._waiting_sync == 0:
+                    self._condition.notify_all()
 
     async def release_sync(self) -> None:
         async with self._condition:
@@ -317,118 +292,290 @@ class _MethodLock:
             self._condition.notify_all()
 
 
-async def _handle_call(
-    connection: Connection,
-    request: object,
-    instance: object,
-    methods: _ExposedMethods,
-    method_lock: _MethodLock,
-) -> None:
-    with connection:
+class _ActorServer:
+    def __init__(self, instance: object, methods: _ExposedMethods) -> None:
+        self.loop = asyncio.get_running_loop()
+        self._instance = instance
+        self._methods = methods
+        self._lock = _MethodLock()
+        self._worker = _SyncWorker()
+        self._shutdown = asyncio.Event()
+        self._stopped = asyncio.Event()
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._accepting_calls = True
+        self._calls: set[asyncio.Task[None]] = set()
+        self._connections: set[asyncio.Task[None]] = set()
+        self._reading: set[asyncio.Task[None]] = set()
+
+    def request_stop(self) -> None:
+        self._shutdown.set()
+
+    def _connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.create_task(self._handle(reader, writer))
+        self._connections.add(task)
+        task.add_done_callback(self._connections.discard)
+
+    async def run(self, listener: socket.socket, startup: Connection) -> None:
+        server = await asyncio.start_server(self._connect, sock=listener)
+        assert _actor_context is not None
+        _actor_context.server = self
+        if _actor_context.stopping:
+            self.request_stop()
+        startup.send_bytes(_serialize(_Result(_actor_context.reference._address)))
+        startup.close()
         try:
-            if not isinstance(request, _Call) or request.method not in methods.all:
+            await self._shutdown.wait()
+            # Keep receiving while active calls finish: those calls may need
+            # more self messages to produce their results.
+            while self._calls:
+                await self._idle.wait()
+            self._accepting_calls = False
+            server.close()
+            # On Python 3.12+, wait_closed() also waits for client connections.
+            # Finish cleanup and release termination waiters before awaiting
+            # it in finally, or their open connections would deadlock shutdown.
+            await _shutdown_owned_processes()
+            await self._worker.close()
+            self._stopped.set()
+            # An idle client that never sends a request must not hold shutdown
+            # open. Termination waiters, in contrast, receive a final response.
+            for task in tuple(self._reading):
+                task.cancel()
+            while self._connections:
+                await asyncio.gather(*self._connections, return_exceptions=True)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def _handle(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = cast(asyncio.Task[None], asyncio.current_task())
+        try:
+            self._reading.add(task)
+            try:
+                request = _deserialize(await _read_frame(reader))
+            finally:
+                self._reading.discard(task)
+            if isinstance(request, _Terminate):
+                self.request_stop()
+                await self._stopped.wait()
+                response: _Response = _Result(None)
+            elif not isinstance(request, _Call):
+                response = _Failure(ActorError("Received an invalid actor request"))
+            elif not self._accepting_calls:
+                response = _Failure(ActorDiedError("Actor is not running"))
+            else:
+                self._calls.add(task)
+                self._idle.clear()
+                response = await self._invoke(request)
+            await _write_frame(writer, _serialize_response(response))
+        except (OSError, asyncio.IncompleteReadError):
+            pass
+        except ActorError as exception:
+            try:
+                await _write_frame(writer, _serialize_response(_Failure(exception)))
+            except OSError:
+                pass
+        finally:
+            self._calls.discard(task)
+            if not self._calls:
+                self._idle.set()
+            await _close_writer(writer)
+
+    async def _invoke(self, request: _Call) -> _Response:
+        try:
+            if request.method not in self._methods.all:
                 raise ActorError("Received a call to an unexposed actor method")
-            method = cast(Callable[..., object], getattr(instance, request.method))
-            if request.method in methods.asynchronous:
-                await method_lock.acquire_async()
+            method = cast(Callable[..., object], getattr(self._instance, request.method))
+            if request.method in self._methods.asynchronous:
+                await self._lock.acquire_async()
                 try:
                     async_method = cast(Callable[..., Awaitable[object]], method)
-                    value = await async_method(*request.args, **request.kwargs)
+                    return _Result(await async_method(*request.args, **request.kwargs))
                 finally:
-                    await method_lock.release_async()
-            else:
-                await method_lock.acquire_sync()
-                try:
-                    value = await asyncio.to_thread(
-                        method, *request.args, **request.kwargs
-                    )
-                finally:
-                    await method_lock.release_sync()
-            response: _Response = _Result(value)
+                    await self._lock.release_async()
+            await self._lock.acquire_sync()
+            try:
+                return await self._worker.call(lambda: method(*request.args, **request.kwargs))
+            finally:
+                await self._lock.release_sync()
         except BaseException as exception:
-            exception.add_note(
-                "Remote actor traceback:\n"
-                + "".join(traceback.format_exception(exception))
-            )
-            response = _Failure(exception)
+            return _remote_failure(exception)
 
-        try:
-            response_data = _serialize(response)
-        except BaseException as exception:
-            fallback = ActorError(f"Could not serialize actor response: {exception}")
-            response_data = _serialize(_Failure(fallback))
 
-        try:
-            await asyncio.to_thread(connection.send_bytes, response_data)
-        except (EOFError, OSError):
-            pass
+async def _join_process(process: SpawnProcess) -> None:
+    # Polling process exit works on both Windows and Unix without a helper
+    # thread. join() is nonblocking once the process has exited.
+    while process.is_alive():
+        await asyncio.sleep(0.01)
+    process.join()
 
 
 async def terminate(actor_ref: ActorRef[object]) -> None:
-    """Terminate an actor and all actors that it owns.
+    """Terminate an actor and its children, finishing accepted calls first.
 
-    The operation is idempotent. Calls through any reference to the terminated
-    actor subsequently raise :class:`ActorDiedError`.
+    External callers wait for shutdown. Self-termination only requests it,
+    allowing the current method to finish. Repeated termination is harmless.
     """
-
-    await asyncio.to_thread(_terminate_ref, actor_ref)
-
-
-def _terminate_ref(actor_ref: ActorRef[object]) -> None:
-    address = actor_ref._address
-    _terminate_at_address(address)
-    process = _owned_processes.pop(address, None)
+    context = _actor_context
+    if context is not None and actor_ref._address == context.reference._address:
+        context.stopping = True
+        if context.server is not None:
+            context.server.loop.call_soon_threadsafe(context.server.request_stop)
+        return
+    try:
+        response = await _exchange(actor_ref._address, _Terminate())
+        if not isinstance(response, _Result):
+            raise ActorError("Actor returned an invalid termination response")
+    except ActorDiedError:
+        pass
+    process = _owned_processes.get(actor_ref._address)
     if process is not None:
+        await _join_process(process)
+        _owned_processes.pop(actor_ref._address, None)
+
+
+async def _shutdown_owned_processes() -> None:
+    await asyncio.gather(*(
+        terminate(ActorRef[object](address, frozenset()))
+        for address in tuple(_owned_processes)
+    ))
+
+
+def _terminate_owned_processes() -> None:
+    """Blocking cleanup at process exit, when no event loop is available."""
+    for address, process in tuple(_owned_processes.items()):
+        if process.is_alive():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                    connection.connect(address)
+                    data = _serialize(_Terminate())
+                    connection.sendall(_FRAME_SIZE.pack(len(data)) + data)
+                    while connection.recv(65536):
+                        pass
+            except OSError:
+                pass
         process.join()
+    _owned_processes.clear()
+
+
+_process_finalizer = Finalize(None, _terminate_owned_processes, exitpriority=10)
+
+
+def _exposed_methods(cls: type[object]) -> _ExposedMethods:
+    exposed: set[str] = set()
+    asynchronous: set[str] = set()
+    for name, descriptor in inspect.getmembers_static(cls):
+        if name.startswith("_") or isinstance(descriptor, (staticmethod, classmethod)):
+            continue
+        if inspect.isfunction(descriptor):
+            exposed.add(name)
+            if inspect.iscoroutinefunction(descriptor):
+                asynchronous.add(name)
+    return _ExposedMethods(frozenset(exposed), frozenset(asynchronous))
+
+
+def _actor_process(
+    class_module: str,
+    class_name: str,
+    args_data: bytes,
+    kwargs_data: bytes,
+    methods: _ExposedMethods,
+    startup: Connection,
+) -> None:
+    global _actor_context
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        try:
+            definition: object = importlib.import_module(class_module)
+            for part in class_name.split("."):
+                definition = getattr(definition, part)
+            cls = cast(type[object], getattr(definition, "_actor_class"))
+            args = cast(tuple[object, ...], _deserialize(args_data))
+            kwargs = cast(dict[str, object], _deserialize(kwargs_data))
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(128)
+            listener.setblocking(False)
+            address = cast(Address, listener.getsockname())
+            _actor_context = _ActorContext(ActorRef(address, methods.all))
+            instance = cls(*args, **kwargs)
+
+            async def serve() -> None:
+                await _ActorServer(instance, methods).run(listener, startup)
+
+            asyncio.run(serve())
+        except BaseException as exception:
+            if startup.closed:
+                raise
+            exception.add_note("The actor failed during initialization")
+            startup.send_bytes(_serialize_response(_Failure(exception)))
+        finally:
+            startup.close()
 
 
 def actor(cls: type[T]) -> ActorClass[T]:
-    """Run instances of ``cls`` as actors in spawned subprocesses.
+    """Run instances of cls in spawned subprocesses, exposing public methods.
 
-    Public instance methods are exposed. Construction starts the subprocess
-    immediately and returns once ``cls.__init__`` has completed.
+    Construction returns once initialization finishes and the server starts.
+    The method name 'terminate' is reserved for ActorRef's shutdown operation.
+    The decorator injects as_actor(), which returns the instance's ActorRef
+    and is available during construction. That name must not already exist.
     """
-
     methods = _exposed_methods(cls)
-    class_data = _serialize(cls)
+    if "terminate" in methods.all:
+        raise ActorError("'terminate' is reserved for ActorRef.terminate()")
+    if any("as_actor" in base.__dict__ for base in cls.__mro__):
+        raise ActorError("'as_actor' is reserved for the injected actor reference method")
+    if "<locals>" in cls.__qualname__:
+        raise ActorError("Actor classes must be defined at module scope, not inside functions")
+    # Discover exposed methods first: as_actor is a local helper, not a message.
+    setattr(cls, "as_actor", _as_actor)
 
     def create_actor(*args: object, **kwargs: object) -> ActorRef[T]:
+        try:
+            args_data, kwargs_data = _serialize(args), _serialize(kwargs)
+        except Exception as exception:
+            raise ActorError("Could not serialize actor constructor arguments") from exception
         context = multiprocessing.get_context("spawn")
         parent_startup, child_startup = context.Pipe(duplex=False)
         process = context.Process(
             target=_actor_process,
             args=(
-                class_data,
-                _serialize(args),
-                _serialize(kwargs),
-                methods,
-                child_startup,
+                cls.__module__, cls.__qualname__, args_data, kwargs_data,
+                methods, child_startup,
             ),
             name=f"{cls.__name__}Actor",
         )
-        process.start()
-        child_startup.close()
-
         try:
-            startup_response = cast(_Response, _receive(parent_startup))
-        except (EOFError, OSError) as exception:
+            process.start()
+        except BaseException:
+            parent_startup.close()
+            raise
+        finally:
+            child_startup.close()
+        try:
+            try:
+                response = _deserialize(parent_startup.recv_bytes())
+            except (EOFError, OSError) as exception:
+                raise ActorError(f"Actor {cls.__name__} failed to start") from exception
+            if isinstance(response, _Failure):
+                process.join()
+                raise response.exception
+            if not isinstance(response, _Result):
+                raise ActorError("Actor returned an invalid startup response")
+        except BaseException:
+            if process.is_alive():
+                process.terminate()
             process.join()
-            raise ActorError(f"Actor {cls.__name__} failed to start") from exception
+            raise
         finally:
             parent_startup.close()
-
-        if isinstance(startup_response, _Failure):
-            process.join()
-            raise startup_response.exception
-        if not isinstance(startup_response, _Result):
-            process.terminate()
-            process.join()
-            raise ActorError("Actor returned an invalid startup response")
-
-        address = cast(Address, startup_response.value)
-        _register_owned_process(address, process)
+        address = cast(Address, response.value)
+        _owned_processes[address] = process
         return ActorRef(address, methods.all)
 
+    setattr(create_actor, "_actor_class", cls)
     create_actor.__name__ = cls.__name__
     create_actor.__qualname__ = cls.__qualname__
     create_actor.__doc__ = cls.__doc__
