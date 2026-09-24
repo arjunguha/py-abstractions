@@ -1,7 +1,7 @@
-"""Subprocess actors with asynchronous socket I/O and one synchronous worker.
+"""Local and subprocess actors communicating through asynchronous socket I/O.
 
-Each actor runs an asyncio event loop. Network I/O never occupies a worker
-thread; synchronous methods share one lazily started auxiliary thread.
+Subprocess actors use one auxiliary thread for synchronous methods. Local
+actors run all methods on the main thread. Network I/O uses no worker threads.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ import struct
 import threading
 import traceback
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from dataclasses import dataclass
+from contextvars import ContextVar, copy_context
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnProcess
 from multiprocessing.util import Finalize
@@ -29,6 +30,7 @@ __all__ = [
     "ActorError",
     "ActorRef",
     "actor",
+    "local_actor",
     "terminate",
 ]
 
@@ -39,10 +41,13 @@ Address = tuple[str, int]
 _FRAME_SIZE = struct.Struct("!Q")
 _owned_processes: dict[Address, SpawnProcess] = {}
 _actor_context: _ActorContext | None = None
+_current_actor: ContextVar[_ActorContext | None] = ContextVar("current_actor", default=None)
+_actor_instances: dict[int, _ActorContext] = {}
+_local_actors: dict[Address, asyncio.Task[None]] = {}
 
 
 class ActorClass(Protocol[T_co]):
-    """The callable produced by :func:`actor`."""
+    """The callable produced by actor or local_actor."""
 
     __name__: str
     __qualname__: str
@@ -96,13 +101,21 @@ class _ActorContext:
     reference: ActorRef[object]
     stopping: bool = False
     server: _ActorServer | None = None
+    instance: object | None = None
+    children: dict[Address, ActorRef[object]] = field(default_factory=dict)
 
 
 def _as_actor(self: object) -> ActorRef[Any]:
     """Return the reference for the actor instance receiving this method."""
-    if _actor_context is None:
+    context = _actor_instances.get(id(self))
+    if context is None:
+        # Construction runs before the instance can be registered.
+        context = _current_actor.get()
+        if context is not None and context.instance is not None:
+            context = None
+    if context is None:
         raise ActorError("as_actor() must be called inside an actor")
-    return _actor_context.reference
+    return context.reference
 
 
 def _serialize(value: object) -> bytes:
@@ -219,7 +232,8 @@ class _SyncWorker:
             self._thread = threading.Thread(target=self._run, name="actor-sync")
             self._thread.start()
         future: asyncio.Future[_Response] = self._loop.create_future()
-        self._jobs.put((method, future))
+        context = copy_context()
+        self._jobs.put((lambda: context.run(method), future))
         return await future
 
     def _run(self) -> None:
@@ -293,12 +307,17 @@ class _MethodLock:
 
 
 class _ActorServer:
-    def __init__(self, instance: object, methods: _ExposedMethods) -> None:
+    def __init__(
+        self, instance: object, methods: _ExposedMethods,
+        context: _ActorContext, *, local: bool = False,
+    ) -> None:
         self.loop = asyncio.get_running_loop()
         self._instance = instance
         self._methods = methods
+        self._context = context
+        context.server = self
         self._lock = _MethodLock()
-        self._worker = _SyncWorker()
+        self._worker = None if local else _SyncWorker()
         self._shutdown = asyncio.Event()
         self._stopped = asyncio.Event()
         self._idle = asyncio.Event()
@@ -316,15 +335,19 @@ class _ActorServer:
         self._connections.add(task)
         task.add_done_callback(self._connections.discard)
 
-    async def run(self, listener: socket.socket, startup: Connection) -> None:
-        server = await asyncio.start_server(self._connect, sock=listener)
-        assert _actor_context is not None
-        _actor_context.server = self
-        if _actor_context.stopping:
-            self.request_stop()
-        startup.send_bytes(_serialize(_Result(_actor_context.reference._address)))
-        startup.close()
+    async def run(
+        self, listener: socket.socket, startup: Connection | None = None,
+    ) -> None:
+        # Service tasks are not method calls, even if their creator was one.
+        token = _current_actor.set(None)
+        server: asyncio.Server | None = None
         try:
+            server = await asyncio.start_server(self._connect, sock=listener)
+            if self._context.stopping:
+                self.request_stop()
+            if startup is not None:
+                startup.send_bytes(_serialize(_Result(self._context.reference._address)))
+                startup.close()
             await self._shutdown.wait()
             # Keep receiving while active calls finish: those calls may need
             # more self messages to produce their results.
@@ -335,8 +358,9 @@ class _ActorServer:
             # On Python 3.12+, wait_closed() also waits for client connections.
             # Finish cleanup and release termination waiters before awaiting
             # it in finally, or their open connections would deadlock shutdown.
-            await _shutdown_owned_processes()
-            await self._worker.close()
+            await _shutdown_children(self._context)
+            if self._worker is not None:
+                await self._worker.close()
             self._stopped.set()
             # An idle client that never sends a request must not hold shutdown
             # open. Termination waiters, in contrast, receive a final response.
@@ -345,8 +369,22 @@ class _ActorServer:
             while self._connections:
                 await asyncio.gather(*self._connections, return_exceptions=True)
         finally:
-            server.close()
-            await server.wait_closed()
+            self._accepting_calls = False
+            if server is not None:
+                server.close()
+            listener.close()
+            # Also clean up when the local actor's event loop shuts down.
+            for task in tuple(self._connections):
+                task.cancel()
+            if self._connections:
+                await asyncio.gather(*self._connections, return_exceptions=True)
+            await _shutdown_children(self._context)
+            if self._worker is not None:
+                await self._worker.close()
+            if server is not None:
+                await server.wait_closed()
+            _actor_instances.pop(id(self._instance), None)
+            _current_actor.reset(token)
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -385,6 +423,7 @@ class _ActorServer:
             await _close_writer(writer)
 
     async def _invoke(self, request: _Call) -> _Response:
+        token = _current_actor.set(self._context)
         try:
             if request.method not in self._methods.all:
                 raise ActorError("Received a call to an unexposed actor method")
@@ -398,11 +437,15 @@ class _ActorServer:
                     await self._lock.release_async()
             await self._lock.acquire_sync()
             try:
+                if self._worker is None:
+                    return _Result(method(*request.args, **request.kwargs))
                 return await self._worker.call(lambda: method(*request.args, **request.kwargs))
             finally:
                 await self._lock.release_sync()
         except BaseException as exception:
             return _remote_failure(exception)
+        finally:
+            _current_actor.reset(token)
 
 
 async def _join_process(process: SpawnProcess) -> None:
@@ -419,7 +462,7 @@ async def terminate(actor_ref: ActorRef[object]) -> None:
     External callers wait for shutdown. Self-termination only requests it,
     allowing the current method to finish. Repeated termination is harmless.
     """
-    context = _actor_context
+    context = _current_actor.get() or _actor_context
     if context is not None and actor_ref._address == context.reference._address:
         context.stopping = True
         if context.server is not None:
@@ -435,13 +478,42 @@ async def terminate(actor_ref: ActorRef[object]) -> None:
     if process is not None:
         await _join_process(process)
         _owned_processes.pop(actor_ref._address, None)
+    local_task = _local_actors.get(actor_ref._address)
+    if local_task is not None:
+        # Cancelling a caller must not cancel the actor's service task.
+        await asyncio.shield(local_task)
 
 
-async def _shutdown_owned_processes() -> None:
-    await asyncio.gather(*(
-        terminate(ActorRef[object](address, frozenset()))
-        for address in tuple(_owned_processes)
-    ))
+async def _shutdown_children(context: _ActorContext) -> None:
+    results = await asyncio.gather(*(
+        terminate(ref) for ref in tuple(context.children.values())
+    ), return_exceptions=True)
+    context.children.clear()
+    # At loop shutdown, local children's service tasks may already be
+    # cancelled. Still wait for every subprocess child to exit.
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            raise result
+
+
+def _register_child(reference: ActorRef[object]) -> None:
+    context = _current_actor.get() or _actor_context
+    if context is not None:
+        context.children[reference._address] = reference
+
+
+def _construct_instance(
+    cls: type[object], args: tuple[object, ...], kwargs: dict[str, object],
+    context: _ActorContext,
+) -> object:
+    token = _current_actor.set(context)
+    try:
+        instance = cls(*args, **kwargs)
+        context.instance = instance
+        _actor_instances[id(instance)] = context
+        return instance
+    finally:
+        _current_actor.reset(token)
 
 
 def _terminate_owned_processes() -> None:
@@ -499,10 +571,10 @@ def _actor_process(
             listener.setblocking(False)
             address = cast(Address, listener.getsockname())
             _actor_context = _ActorContext(ActorRef(address, methods.all))
-            instance = cls(*args, **kwargs)
+            instance = _construct_instance(cls, args, kwargs, _actor_context)
 
             async def serve() -> None:
-                await _ActorServer(instance, methods).run(listener, startup)
+                await _ActorServer(instance, methods, _actor_context).run(listener, startup)
 
             asyncio.run(serve())
         except BaseException as exception:
@@ -514,6 +586,19 @@ def _actor_process(
             startup.close()
 
 
+def _prepare_actor(cls: type[object], *, local: bool) -> _ExposedMethods:
+    methods = _exposed_methods(cls)
+    if "terminate" in methods.all:
+        raise ActorError("'terminate' is reserved for ActorRef.terminate()")
+    if any("as_actor" in base.__dict__ for base in cls.__mro__):
+        raise ActorError("'as_actor' is reserved for the injected actor reference method")
+    if not local and "<locals>" in cls.__qualname__:
+        raise ActorError("Actor classes must be defined at module scope, not inside functions")
+    # Discover exposed methods first: as_actor is a local helper, not a message.
+    setattr(cls, "as_actor", _as_actor)
+    return methods
+
+
 def actor(cls: type[T]) -> ActorClass[T]:
     """Run instances of cls in spawned subprocesses, exposing public methods.
 
@@ -522,15 +607,7 @@ def actor(cls: type[T]) -> ActorClass[T]:
     The decorator injects as_actor(), which returns the instance's ActorRef
     and is available during construction. That name must not already exist.
     """
-    methods = _exposed_methods(cls)
-    if "terminate" in methods.all:
-        raise ActorError("'terminate' is reserved for ActorRef.terminate()")
-    if any("as_actor" in base.__dict__ for base in cls.__mro__):
-        raise ActorError("'as_actor' is reserved for the injected actor reference method")
-    if "<locals>" in cls.__qualname__:
-        raise ActorError("Actor classes must be defined at module scope, not inside functions")
-    # Discover exposed methods first: as_actor is a local helper, not a message.
-    setattr(cls, "as_actor", _as_actor)
+    methods = _prepare_actor(cls, local=False)
 
     def create_actor(*args: object, **kwargs: object) -> ActorRef[T]:
         try:
@@ -573,7 +650,9 @@ def actor(cls: type[T]) -> ActorClass[T]:
             parent_startup.close()
         address = cast(Address, response.value)
         _owned_processes[address] = process
-        return ActorRef(address, methods.all)
+        reference: ActorRef[T] = ActorRef(address, methods.all)
+        _register_child(reference)
+        return reference
 
     setattr(create_actor, "_actor_class", cls)
     create_actor.__name__ = cls.__name__
@@ -581,3 +660,63 @@ def actor(cls: type[T]) -> ActorClass[T]:
     create_actor.__doc__ = cls.__doc__
     create_actor.__module__ = cls.__module__
     return cast(ActorClass[T], create_actor)
+
+
+def local_actor(cls: type[T]) -> ActorClass[T]:
+    """Run instances on the main process's running asyncio loop, in its main thread.
+
+    Both sync and async methods run on that thread. Blocking synchronous
+    methods therefore block the loop. References use the same pickleable TCP
+    protocol as subprocess actors. The loop must run for messages to be served.
+    """
+    methods = _prepare_actor(cls, local=True)
+
+    def create_local_actor(*args: object, **kwargs: object) -> ActorRef[T]:
+        if (threading.current_thread() is not threading.main_thread()
+                or multiprocessing.parent_process() is not None):
+            raise ActorError("Local actors must be created in the main process's main thread")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exception:
+            raise ActorError("Local actors require a running asyncio event loop") from exception
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        context: _ActorContext | None = None
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(128)
+            listener.setblocking(False)
+            address = cast(Address, listener.getsockname())
+            reference: ActorRef[T] = ActorRef(address, methods.all)
+            context = _ActorContext(reference)
+            instance = _construct_instance(cls, args, kwargs, context)
+            server = _ActorServer(instance, methods, context, local=True)
+            task = loop.create_task(server.run(listener))
+        except BaseException:
+            listener.close()
+            if context is not None and context.children:
+                loop.create_task(_shutdown_children(context))
+            raise
+
+        _local_actors[address] = task
+
+        def finished(task: asyncio.Task[None]) -> None:
+            _local_actors.pop(address, None)
+            _actor_instances.pop(id(instance), None)
+            listener.close()
+            if not task.cancelled() and task.exception() is not None:
+                loop.call_exception_handler({
+                    "message": "Local actor server failed",
+                    "exception": task.exception(),
+                    "task": task,
+                })
+
+        task.add_done_callback(finished)
+        _register_child(reference)
+        return reference
+
+    create_local_actor.__name__ = cls.__name__
+    create_local_actor.__qualname__ = cls.__qualname__
+    create_local_actor.__doc__ = cls.__doc__
+    create_local_actor.__module__ = cls.__module__
+    return cast(ActorClass[T], create_local_actor)

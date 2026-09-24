@@ -9,7 +9,7 @@ Classes defined inside functions are not supported. Guard application startup
 with `if __name__ == "__main__":`, as in the example below.
 
 The actor implementation uses only the Python standard library. Network I/O and
-async methods run on the actor's event loop. Synchronous methods share one
+async methods run on the actor's event loop. Subprocess actors' synchronous methods share one
 dedicated auxiliary thread, created on the first synchronous call. There are no
 thread pools or threads waiting for message responses.
 
@@ -45,6 +45,69 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Actors on the main thread
+
+Use `@local_actor` for objects that must stay in the main process and on its
+main thread. Construct them inside a running asyncio loop on that thread.
+Construction runs immediately; the server starts on the loop, and calls through
+the returned `ActorRef` use the same TCP protocol as subprocess actors.
+
+```python
+from abstractions.actor import actor, local_actor, ActorRef
+
+
+@local_actor
+class Results:
+    def __init__(self) -> None:
+        self.values = []
+
+    async def add(self, value: int) -> None:
+        self.values.append(value)
+
+    def snapshot(self) -> list[int]:
+        return list(self.values)
+
+
+@actor
+class Worker:
+    async def deliver(self, results: ActorRef, value: int) -> None:
+        await results.add(value)
+
+
+async def main() -> None:
+    results = Results()
+    worker = Worker()
+    try:
+        await worker.deliver(results, 42)
+        assert await results.snapshot() == [42]
+    finally:
+        await worker.terminate()
+        await results.terminate()
+```
+
+Local references are pickleable and can be passed to or returned from any
+actor. Local actors can also send messages to subprocess actors and to
+themselves using `self.as_actor()`. Multiple local actors keep separate state,
+self references, and child ownership.
+
+Both synchronous and asynchronous local methods run on the main thread, with
+the same method-exclusion rules described below. No auxiliary thread is used.
+A blocking synchronous method blocks the main event loop, including other
+local actors; use async methods for operations that need to wait.
+
+Local actor classes may be defined inside functions. Their constructor
+arguments are passed directly, so they can hold resources that cannot be
+pickled. Message arguments, results, and exceptions still use `pickle`, even
+for calls from the same process; a message is not a direct Python method call.
+
+Local actors require their creating loop to keep running. Terminating one
+drains its calls and stops the actors it created, without stopping unrelated
+actors in the same process. When the loop shuts down, remaining local actors
+close their connections, cancel unfinished calls, and clean up their children.
+For graceful completion, explicitly await `ref.terminate()` before leaving the
+loop. Constructing a local actor in an auxiliary thread or a subprocess raises
+`ActorError`.
+
 ## Exposed methods
 
 An actor exposes only methods that:
@@ -77,7 +140,7 @@ class Example:
 
 Calls to async methods on one actor can run concurrently. A synchronous method
 executes exclusively: it waits for running async methods to finish and prevents
-other sync or async methods from running until it returns. The actor continues
+other sync or async methods from running until it returns. A subprocess actor continues
 to receive calls while a synchronous method holds the lock, so submitting an
 async call does not block the caller's event loop.
 Scheduling favors synchronous calls: once one is waiting, new async calls wait
